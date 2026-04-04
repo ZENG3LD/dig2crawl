@@ -187,9 +187,9 @@ async fn main() -> Result<()> {
 async fn make_fetcher(
     browser: bool,
     wait_selector: Option<String>,
-) -> Result<Box<dyn crawl_core::traits::Fetcher>> {
+) -> Result<Box<dyn dig2crawl::core::traits::Fetcher>> {
     if browser {
-        let fetcher = crawl_fetch::browser::BrowserFetcher::new(
+        let fetcher = dig2crawl::fetch::browser::BrowserFetcher::new(
             1,
             dig2browser::StealthConfig::russian(),
             wait_selector,
@@ -198,7 +198,7 @@ async fn make_fetcher(
         .context("Failed to start browser")?;
         Ok(Box::new(fetcher))
     } else {
-        let fetcher = crawl_fetch::http::HttpFetcher::new(
+        let fetcher = dig2crawl::fetch::http::HttpFetcher::new(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 dig2crawl/0.1",
         )
         .context("Failed to create HTTP client")?;
@@ -207,9 +207,9 @@ async fn make_fetcher(
 }
 
 async fn fetch_page(
-    fetcher: &dyn crawl_core::traits::Fetcher,
+    fetcher: &dyn dig2crawl::core::traits::Fetcher,
     url_str: &str,
-) -> Result<crawl_core::types::FetchedPage> {
+) -> Result<dig2crawl::core::types::FetchedPage> {
     use url::Url;
     let url = Url::parse(url_str).with_context(|| format!("Invalid URL: {url_str}"))?;
     fetcher
@@ -221,7 +221,7 @@ async fn fetch_page(
 /// Parse the raw agent response string into `AgentResponse`.
 ///
 /// Claude sometimes wraps JSON in a markdown code fence — we strip those.
-fn parse_agent_response(raw: &str) -> Result<crawl_agent::protocol::AgentResponse> {
+fn parse_agent_response(raw: &str) -> Result<dig2crawl::agent::protocol::AgentResponse> {
     let json_str = extract_json_block(raw);
     serde_json::from_str(json_str)
         .with_context(|| format!("Failed to parse agent response as JSON:\n{json_str}"))
@@ -251,17 +251,17 @@ fn extract_json_block(s: &str) -> &str {
     s.trim()
 }
 
-/// Build a `crawl_core::types::SiteProfile` from an `AgentResponse`.
+/// Build a `dig2crawl::core::types::SiteProfile` from an `AgentResponse`.
 ///
 /// The discovery response contains `field_configs` (v2) and `updated_memory`
 /// with the container selector. We prefer the v2 field configs when present.
 fn build_site_profile(
     domain: &str,
-    response: &crawl_agent::protocol::AgentResponse,
+    response: &dig2crawl::agent::protocol::AgentResponse,
     browser_required: bool,
-) -> Result<crawl_core::types::SiteProfile> {
+) -> Result<dig2crawl::core::types::SiteProfile> {
     use chrono::Utc;
-    use crawl_core::types::{ExtractMode, FieldConfig, SiteProfile};
+    use dig2crawl::core::types::{ExtractMode, FieldConfig, SiteProfile};
 
     // Container selector comes from updated_memory.selectors
     let container_selector = response
@@ -280,30 +280,30 @@ fn build_site_profile(
                 name: fc.name.clone(),
                 selector: fc.selector.clone(),
                 extract: match &fc.extract {
-                    crawl_agent::protocol::ExtractMode::Text => ExtractMode::Text,
-                    crawl_agent::protocol::ExtractMode::Attribute(a) => {
+                    dig2crawl::agent::protocol::ExtractMode::Text => ExtractMode::Text,
+                    dig2crawl::agent::protocol::ExtractMode::Attribute(a) => {
                         ExtractMode::Attribute(a.clone())
                     }
-                    crawl_agent::protocol::ExtractMode::Html => ExtractMode::Html,
-                    crawl_agent::protocol::ExtractMode::OuterHtml => ExtractMode::OuterHtml,
+                    dig2crawl::agent::protocol::ExtractMode::Html => ExtractMode::Html,
+                    dig2crawl::agent::protocol::ExtractMode::OuterHtml => ExtractMode::OuterHtml,
                 },
                 prefix: fc.prefix.clone(),
                 transform: fc.transform.as_ref().map(|t| match t {
-                    crawl_agent::protocol::Transform::Trim => crawl_core::types::Transform::Trim,
-                    crawl_agent::protocol::Transform::Lowercase => {
-                        crawl_core::types::Transform::Lowercase
+                    dig2crawl::agent::protocol::Transform::Trim => dig2crawl::core::types::Transform::Trim,
+                    dig2crawl::agent::protocol::Transform::Lowercase => {
+                        dig2crawl::core::types::Transform::Lowercase
                     }
-                    crawl_agent::protocol::Transform::Uppercase => {
-                        crawl_core::types::Transform::Uppercase
+                    dig2crawl::agent::protocol::Transform::Uppercase => {
+                        dig2crawl::core::types::Transform::Uppercase
                     }
-                    crawl_agent::protocol::Transform::Regex(p) => {
-                        crawl_core::types::Transform::Regex(p.clone())
+                    dig2crawl::agent::protocol::Transform::Regex(p) => {
+                        dig2crawl::core::types::Transform::Regex(p.clone())
                     }
-                    crawl_agent::protocol::Transform::Replace(f, t) => {
-                        crawl_core::types::Transform::Replace(f.clone(), t.clone())
+                    dig2crawl::agent::protocol::Transform::Replace(f, t) => {
+                        dig2crawl::core::types::Transform::Replace(f.clone(), t.clone())
                     }
-                    crawl_agent::protocol::Transform::ParseNumber => {
-                        crawl_core::types::Transform::ParseNumber
+                    dig2crawl::agent::protocol::Transform::ParseNumber => {
+                        dig2crawl::core::types::Transform::ParseNumber
                     }
                 }),
             })
@@ -370,7 +370,7 @@ async fn cmd_discover(
 
     // 2. Anti-bot check
     println!("[2/5] Checking for anti-bot protection...");
-    let antibot = dig2crawl_parser::AntiBotDetector::new().detect(&page.body);
+    let antibot = dig2crawl::parser::AntiBotDetector::new().detect(&page.body);
     if antibot.detected {
         eprintln!(
             "WARNING: Anti-bot detected! Provider: {}, Type: {}",
@@ -384,9 +384,9 @@ async fn cmd_discover(
 
     // 3. Extract JSON-LD and metadata as bonus context
     println!("[3/5] Extracting JSON-LD and metadata...");
-    let jsonld_items = dig2crawl_parser::JsonLdExtractor::extract_jsonld(&page.body);
+    let jsonld_items = dig2crawl::parser::JsonLdExtractor::extract_jsonld(&page.body);
     let parsed_url = url::Url::parse(&url_str)?;
-    let metadata = dig2crawl_parser::MetadataExtractor::new().extract(&page.body, Some(&parsed_url));
+    let metadata = dig2crawl::parser::MetadataExtractor::new().extract(&page.body, Some(&parsed_url));
     if !jsonld_items.is_empty() {
         println!("      JSON-LD: {} block(s) found", jsonld_items.len());
     }
@@ -396,7 +396,7 @@ async fn cmd_discover(
 
     // 4. Start AgentSession and send discovery prompt (bootstrap file pattern)
     println!("[4/5] Starting Claude session...");
-    let mut session = crawl_agent::session::AgentSession::start()
+    let mut session = dig2crawl::agent::session::AgentSession::start()
         .await
         .context("Failed to start Claude agent session. Is `claude` CLI installed?")?;
 
@@ -425,7 +425,7 @@ async fn cmd_discover(
     // Build the discovery prompt that references the HTML file
     let response_path = job_dir.join("response.json");
     let discovery_prompt =
-        crawl_agent::prompts::build_discovery_prompt(&html_path, &response_path, &full_goal);
+        dig2crawl::agent::prompts::build_discovery_prompt(&html_path, &response_path, &full_goal);
 
     // Write prompt to file — Claude reads it via bootstrap
     let prompt_path = job_dir.join("prompt.md");
@@ -473,7 +473,7 @@ async fn cmd_discover(
 
     // 5. Apply SelectorExtractor to validate on the same page
     println!("[5/5] Validating selectors on fetched page...");
-    let extractor = dig2crawl_parser::SelectorExtractor::new();
+    let extractor = dig2crawl::parser::SelectorExtractor::new();
     let extracted_records = extractor.extract(&page.body, &profile);
 
     println!("      Extracted {} record(s) with discovered selectors", extracted_records.len());
@@ -482,7 +482,7 @@ async fn cmd_discover(
     if !extracted_records.is_empty() {
         let snapshot = discovery_response.updated_memory.clone().unwrap_or_default();
         let validation_prompt =
-            crawl_agent::prompts::build_validation_prompt(&extracted_records, &snapshot);
+            dig2crawl::agent::prompts::build_validation_prompt(&extracted_records, &snapshot);
 
         // Write validation prompt + output path to files
         let validation_response_path = job_dir.join("validation_response.json");
@@ -578,11 +578,11 @@ async fn cmd_extract(
     // Load profile
     let profile_json = std::fs::read_to_string(&profile_path)
         .with_context(|| format!("Failed to read profile: {}", profile_path.display()))?;
-    let profile: crawl_core::types::SiteProfile = serde_json::from_str(&profile_json)
+    let profile: dig2crawl::core::types::SiteProfile = serde_json::from_str(&profile_json)
         .with_context(|| format!("Failed to parse profile: {}", profile_path.display()))?;
 
     let fetcher = make_fetcher(browser || profile.requires_browser, None).await?;
-    let extractor = dig2crawl_parser::SelectorExtractor::new();
+    let extractor = dig2crawl::parser::SelectorExtractor::new();
 
     let mut all_records: Vec<serde_json::Value> = Vec::new();
     let mut current_url = url_str.clone();
@@ -598,17 +598,17 @@ async fn cmd_extract(
 
         // Follow pagination if configured (NextButton only for now)
         if pages_done < max_pages {
-            if let Some(crawl_core::types::PaginationConfig::NextButton { selector }) =
+            if let Some(dig2crawl::core::types::PaginationConfig::NextButton { selector }) =
                 &profile.pagination
             {
                 // Extract the href from the next-button element using a single-field profile
-                let nav_profile = crawl_core::types::SiteProfile {
+                let nav_profile = dig2crawl::core::types::SiteProfile {
                     domain: profile.domain.clone(),
                     container_selector: selector.clone(),
-                    fields: vec![crawl_core::types::FieldConfig {
+                    fields: vec![dig2crawl::core::types::FieldConfig {
                         name: "href".to_string(),
                         selector: selector.clone(),
-                        extract: crawl_core::types::ExtractMode::Attribute("href".to_string()),
+                        extract: dig2crawl::core::types::ExtractMode::Attribute("href".to_string()),
                         prefix: None,
                         transform: None,
                     }],
@@ -619,7 +619,7 @@ async fn cmd_extract(
                     created_at: profile.created_at,
                     last_used_at: profile.last_used_at,
                 };
-                let nav_extractor = dig2crawl_parser::SelectorExtractor::new();
+                let nav_extractor = dig2crawl::parser::SelectorExtractor::new();
                 let nav_records = nav_extractor.extract(&page.body, &nav_profile);
                 if let Some(rec) = nav_records.first() {
                     if let Some(href) = rec.get("href").and_then(|v| v.as_str()) {
@@ -663,24 +663,24 @@ fn cmd_export_spec(
 ) -> Result<()> {
     let profile_json = std::fs::read_to_string(&profile_path)
         .with_context(|| format!("Failed to read profile: {}", profile_path.display()))?;
-    let site_profile: crawl_core::types::SiteProfile = serde_json::from_str(&profile_json)
+    let site_profile: dig2crawl::core::types::SiteProfile = serde_json::from_str(&profile_json)
         .context("Failed to parse profile JSON")?;
 
-    let spec = crawl_core::types::DaemonSpec {
+    let spec = dig2crawl::core::types::DaemonSpec {
         name: format!("{}-crawler", site_profile.domain),
         domain: site_profile.domain.clone(),
         seed_urls: vec![format!("https://{}/", site_profile.domain)],
         site_profile,
-        schedule: crawl_core::types::CronSchedule {
+        schedule: dig2crawl::core::types::CronSchedule {
             expression: schedule,
         },
-        fetch_method: crawl_core::types::FetchMethod::Http,
-        rate_limit: crawl_core::types::RateLimitConfig {
+        fetch_method: dig2crawl::core::types::FetchMethod::Http,
+        rate_limit: dig2crawl::core::types::RateLimitConfig {
             requests_per_second: 1.0,
             min_delay_ms: 1000,
             concurrent_requests: 1,
         },
-        output_format: crawl_core::types::OutputFormat::Jsonl,
+        output_format: dig2crawl::core::types::OutputFormat::Jsonl,
         created_at: chrono::Utc::now(),
         spec_version: "1.0".to_string(),
     };
@@ -719,7 +719,7 @@ async fn cmd_fetch(
     );
 
     if show_antibot {
-        let result = dig2crawl_parser::AntiBotDetector::new().detect(&page.body);
+        let result = dig2crawl::parser::AntiBotDetector::new().detect(&page.body);
         if result.detected {
             eprintln!(
                 "Anti-bot: {} ({})",
@@ -734,7 +734,7 @@ async fn cmd_fetch(
     if show_metadata {
         let parsed_url = url::Url::parse(&url_str)?;
         let meta =
-            dig2crawl_parser::MetadataExtractor::new().extract(&page.body, Some(&parsed_url));
+            dig2crawl::parser::MetadataExtractor::new().extract(&page.body, Some(&parsed_url));
         eprintln!("Metadata:");
         if let Some(t) = &meta.title {
             eprintln!("  title: {t}");
@@ -748,7 +748,7 @@ async fn cmd_fetch(
     }
 
     if show_jsonld {
-        let items = dig2crawl_parser::JsonLdExtractor::extract_jsonld(&page.body);
+        let items = dig2crawl::parser::JsonLdExtractor::extract_jsonld(&page.body);
         eprintln!("JSON-LD ({} blocks):", items.len());
         for item in &items {
             eprintln!(
@@ -776,7 +776,7 @@ async fn cmd_test_selector(
     browser: bool,
 ) -> Result<()> {
     use chrono::Utc;
-    use crawl_core::types::{ExtractMode, FieldConfig, SiteProfile};
+    use dig2crawl::core::types::{ExtractMode, FieldConfig, SiteProfile};
 
     let fetcher = make_fetcher(browser, None).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
@@ -814,7 +814,7 @@ async fn cmd_test_selector(
         last_used_at: now,
     };
 
-    let extractor = dig2crawl_parser::SelectorExtractor::new();
+    let extractor = dig2crawl::parser::SelectorExtractor::new();
     let records = extractor.extract(&page.body, &profile);
 
     println!("Selector: {selector}");
@@ -854,8 +854,8 @@ async fn cmd_collect_links(
             }
         };
 
-        let link_extractor = dig2crawl_parser::LinkExtractor::new();
-        let filter = dig2crawl_parser::links::LinkFilter {
+        let link_extractor = dig2crawl::parser::LinkExtractor::new();
+        let filter = dig2crawl::parser::links::LinkFilter {
             http_only: true,
             allowed_domains: if domain_only {
                 Some(vec![seed_domain.clone()])

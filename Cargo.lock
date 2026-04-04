@@ -414,79 +414,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crawl-agent"
-version = "0.2.3"
-dependencies = [
- "chrono",
- "crawl-core",
- "futures",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "crawl-core"
-version = "0.2.3"
-dependencies = [
- "ahash",
- "chrono",
- "futures",
- "governor",
- "regex",
- "scraper",
- "serde",
- "serde_json",
- "smol_str",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "crawl-fetch"
-version = "0.2.3"
-dependencies = [
- "chrono",
- "crawl-core",
- "dig2browser",
- "futures",
- "rand 0.8.5",
- "reqwest",
- "thiserror",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "crawl-storage"
-version = "0.2.3"
-dependencies = [
- "ahash",
- "chrono",
- "crawl-core",
- "csv",
- "futures",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -630,52 +557,30 @@ dependencies = [
 name = "dig2crawl"
 version = "0.2.3"
 dependencies = [
+ "ahash",
  "anyhow",
  "chrono",
  "clap",
- "crawl-agent",
- "crawl-core",
- "crawl-fetch",
- "crawl-storage",
+ "csv",
  "dig2browser",
- "dig2crawl-config",
- "dig2crawl-parser",
+ "futures",
+ "governor",
+ "rand 0.8.5",
+ "regex",
+ "reqwest",
  "rusqlite",
+ "scraper",
  "serde",
  "serde_json",
+ "smol_str",
+ "tempfile",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "dig2crawl-config"
-version = "0.2.3"
-dependencies = [
- "chrono",
- "crawl-core",
- "serde",
- "serde_json",
- "thiserror",
- "toml",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "dig2crawl-parser"
-version = "0.2.3"
-dependencies = [
- "crawl-core",
- "regex",
- "scraper",
- "serde",
- "serde_json",
- "tracing",
- "url",
 ]
 
 [[package]]

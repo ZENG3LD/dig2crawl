@@ -1,13 +1,20 @@
-[workspace]
-members = ["crates/*"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "dig2crawl"
+version = "0.3.0"
 edition = "2021"
-version = "0.2.3"
 license = "MIT"
+description = "Universal agnostic web crawler with Claude-powered CSS selector discovery"
+repository = "https://github.com/ZENG3LD/dig2crawl"
 
-[workspace.dependencies]
+[[bin]]
+name = "dig2crawl"
+path = "src/main.rs"
+
+[lib]
+name = "dig2crawl"
+path = "src/lib.rs"
+
+[dependencies]
 tokio          = { version = "1", features = ["full"] }
 reqwest        = { version = "0.12", features = ["json", "cookies", "gzip", "brotli", "deflate"] }
 serde          = { version = "1", features = ["derive"] }
@@ -33,42 +40,4 @@ tempfile       = "3"
 rand           = "0.8"
 dig2browser    = { path = "../dig2browser", version = "0.3.3" }
 
-crawl-core          = { path = "crates/core",    version = "0.2.3" }
-crawl-fetch         = { path = "crates/fetch",   version = "0.2.3" }
-crawl-agent         = { path = "crates/agent",   version = "0.2.3" }
-crawl-storage       = { path = "crates/storage", version = "0.2.3" }
-dig2crawl-config    = { path = "crates/config",  version = "0.2.3" }
-dig2crawl-parser    = { path = "crates/parser",  version = "0.2.3" }
-
-[package]
-name = "dig2crawl"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
-description = "Universal agnostic web crawler with Claude-powered CSS selector discovery"
-repository = "https://github.com/ZENG3LD/dig2crawl"
-
-[[bin]]
-name = "dig2crawl"
-path = "src/main.rs"
-
-[dependencies]
-crawl-core.workspace = true
-crawl-fetch.workspace = true
-crawl-agent.workspace = true
-crawl-storage.workspace = true
-dig2crawl-parser.workspace = true
-dig2crawl-config.workspace = true
-tokio.workspace = true
-clap.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-uuid.workspace = true
-serde_json.workspace = true
-serde.workspace = true
-chrono.workspace = true
-url.workspace = true
-dig2browser.workspace = true
-rusqlite.workspace = true
-toml.workspace = true
+[workspace]
