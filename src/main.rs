@@ -144,8 +144,8 @@ async fn main() -> Result<()> {
     let signer: Option<Arc<dig2browser::bot_auth::RequestSigner>> =
         if let Some(jwks_url) = &cli.bot_auth {
             let identity = dig2browser::bot_auth::BotIdentity::new(
-                "dig2crawl",
-                "https://github.com/ZENG3LD/dig2crawl",
+                "dig2browser",
+                "https://github.com/ZENG3LD/dig2browser",
                 jwks_url.clone(),
                 &cli.bot_key,
             );

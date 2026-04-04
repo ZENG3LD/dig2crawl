@@ -7,3 +7,4 @@ docs/research/
 # Bot auth private keys — NEVER commit
 keys/
 *.key
+.env
