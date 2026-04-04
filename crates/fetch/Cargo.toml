@@ -13,3 +13,4 @@ thiserror.workspace = true
 chrono.workspace = true
 dig2browser.workspace = true
 futures.workspace = true
+rand.workspace = true

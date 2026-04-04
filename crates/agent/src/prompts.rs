@@ -1,3 +1,8 @@
+use crate::protocol::SiteMemorySnapshot;
+use serde_json::Value;
+
+// ── System prompt (v1, unchanged — used by ClaudeSpawner one-shot mode) ──────
+
 pub const AGENT_SYSTEM_PROMPT: &str = r#"You are a web data extraction agent. Your job is to analyse an HTML page and extract structured data from it.
 
 You will receive a JSON request describing:
@@ -61,3 +66,168 @@ Your response MUST be a single valid JSON object:
 - Always update `updated_memory.selectors` with CSS selectors you discovered.
 - Do not hallucinate data. If a field is absent, use null.
 - Return one JSON object and nothing else. No markdown, no explanation."#;
+
+// ── Phase 1: Discovery prompt ─────────────────────────────────────────────────
+
+/// Build a Phase 1 (discovery) prompt for `AgentSession`.
+///
+/// The prompt instructs Claude to analyse the provided HTML and return a JSON
+/// object describing: the container selector, per-field selectors with extraction
+/// modes, and the pagination pattern (if any).
+///
+/// The response must conform to the v2 `AgentResponse` JSON shape so it can be
+/// parsed by `ClaudeSpawner::parse_response` without modification.
+pub fn build_discovery_prompt(html: &str, goal: &str) -> String {
+    format!(
+        r#"You are a CSS selector discovery agent. Your task is to analyse HTML and find precise selectors for structured data extraction.
+
+## Goal
+{goal}
+
+## HTML to analyse
+```html
+{html}
+```
+
+## Your task
+
+1. Find the CSS selector for the **repeating container** element that wraps each individual item (e.g. a product card, a job listing, an article summary).
+2. For each requested field, find the CSS selector **relative to the container** and determine the best extraction mode.
+3. Identify the pagination pattern if one exists.
+
+## Response format
+
+Return ONLY a single valid JSON object — no prose, no markdown, no explanation:
+
+```json
+{{
+  "version": "2.0.0",
+  "task_id": "discovery",
+  "status": "success",
+  "records": [],
+  "next_urls": [],
+  "confidence": 0.85,
+  "logs": ["<brief note about what you found>"],
+  "field_configs": [
+    {{
+      "name": "<field name from goal>",
+      "selector": "<CSS selector relative to container>",
+      "extract": "text",
+      "prefix": null,
+      "transform": null
+    }}
+  ],
+  "pagination": {{
+    "type": "next_button",
+    "selector": "a.next-page"
+  }}
+}}
+```
+
+### `extract` values
+- `"text"` — element.textContent trimmed
+- `{{"attribute": "href"}}` — element.getAttribute("href")
+- `"html"` — element.innerHTML
+- `"outer_html"` — element.outerHTML
+
+### `transform` values (optional, null if not needed)
+- `"trim"` — trim whitespace
+- `"lowercase"` / `"uppercase"`
+- `{{"regex": "pattern"}}` — return capture group 1
+- `{{"replace": ["from", "to"]}}`
+- `"parse_number"`
+
+### `pagination` type values
+- `{{"type": "next_button", "selector": "..."}}` — a "Next" link/button
+- `{{"type": "url_pattern", "template": "https://site.com/page/{{n}}", "start": 1, "end": null, "step": 1}}`
+- `{{"type": "infinite_scroll", "trigger_px": 200, "max_scrolls": 20}}`
+- `{{"type": "load_more", "button_selector": "...", "max_clicks": 10}}`
+- `{{"type": "offset_param", "param_name": "offset", "page_size": 20, "max_pages": null}}`
+- omit the `"pagination"` key entirely if there is no pagination
+
+## Rules
+- Container selector must match ALL items on the page, not just one.
+- Field selectors must be relative to the container element.
+- Only include fields that are present in the HTML. Use null confidence values (0.0) for fields you could not find.
+- Do not hallucinate selectors. If unsure, set a lower confidence value.
+- Return exactly one JSON object. Nothing else."#
+    )
+}
+
+// ── Phase 2: Validation prompt ────────────────────────────────────────────────
+
+/// Build a Phase 2 (validation) prompt for `AgentSession`.
+///
+/// Asks Claude to verify whether the `SiteMemorySnapshot` selectors discovered in
+/// Phase 1 actually match the provided sample data. Returns a `validation_result`
+/// block inside the standard `AgentResponse` JSON.
+///
+/// `extracted_data` is a slice of JSON values produced by the fast-path selector
+/// extractor. The prompt shows Claude this data so it can cross-check field
+/// coverage and value quality without re-reading the full HTML.
+pub fn build_validation_prompt(extracted_data: &[Value], profile: &SiteMemorySnapshot) -> String {
+    let data_json = serde_json::to_string_pretty(extracted_data)
+        .unwrap_or_else(|_| "[]".to_string());
+    let profile_json = serde_json::to_string_pretty(profile)
+        .unwrap_or_else(|_| "{}".to_string());
+
+    format!(
+        r#"You are a data quality validation agent. Your task is to verify whether CSS-selector-based extraction produced correct, complete results.
+
+## Site profile (selectors that were used)
+```json
+{profile_json}
+```
+
+## Extracted data (sample — up to 10 items)
+```json
+{data_json}
+```
+
+## Your task
+
+Review the extracted data against the site profile and answer:
+1. Did the container selector match items correctly (no empty or garbage records)?
+2. For each field, does the extracted value look correct and complete?
+3. Are there any systematic errors (wrong selector, missing data, garbled text)?
+4. What is your overall confidence that this config will work on future pages?
+
+## Response format
+
+Return ONLY a single valid JSON object — no prose, no markdown:
+
+```json
+{{
+  "version": "2.0.0",
+  "task_id": "validation",
+  "status": "success",
+  "records": [],
+  "next_urls": [],
+  "confidence": 0.9,
+  "logs": [],
+  "validation_result": {{
+    "passed": true,
+    "items_extracted": 8,
+    "field_status": {{
+      "title": true,
+      "price": true,
+      "url": false
+    }},
+    "summary": "Container selector matched 8 items. Title and price fields extracted correctly. URL field returned relative paths — prefix needed.",
+    "confidence": 0.87,
+    "issues": [
+      "url field: values are relative (/product/123), need domain prefix"
+    ]
+  }}
+}}
+```
+
+## Rules
+- `passed` is true only if the majority of fields extracted meaningful non-empty values.
+- `items_extracted` is the count of non-empty records in the sample data.
+- `field_status` must have an entry for every field present in the site profile.
+- `issues` lists actionable problems — empty array if everything is fine.
+- `confidence` reflects how likely this config is to work on unseen pages of the same site.
+- Return exactly one JSON object. Nothing else."#
+    )
+}

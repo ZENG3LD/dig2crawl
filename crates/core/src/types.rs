@@ -163,3 +163,137 @@ pub struct PageMeta {
     pub canonical_url: Option<Url>,
     pub language: Option<String>,
 }
+
+// ---- Site profile (learned by Claude, consumed by SelectorExtractor) ----
+
+/// What Claude discovers about a site during Phase 1+2.
+/// Stored per domain, persisted to the site_profiles table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteProfile {
+    pub domain: String,
+    /// CSS selector for the repeating container element.
+    pub container_selector: String,
+    /// One entry per field in the user's goal.
+    pub fields: Vec<FieldConfig>,
+    pub pagination: Option<PaginationConfig>,
+    pub requires_browser: bool,
+    /// Claude's confidence after validation [0.0, 1.0].
+    pub confidence: f64,
+    /// Whether Phase 2 validation was completed.
+    pub validated: bool,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
+}
+
+/// Rich per-field extraction spec learned by Claude, consumed by `SelectorExtractor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldConfig {
+    pub name: String,
+    pub selector: String,
+    pub extract: ExtractMode,
+    /// Prepend domain for relative URLs (e.g. `"https://example.com"`).
+    pub prefix: Option<String>,
+    pub transform: Option<Transform>,
+}
+
+/// How to extract the value from a matched element.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractMode {
+    /// Trimmed text content of the element.
+    Text,
+    /// Value of the named HTML attribute.
+    Attribute(String),
+    /// Inner HTML of the element (excludes the element tag itself).
+    Html,
+    /// Outer HTML of the element (includes the element tag).
+    OuterHtml,
+}
+
+/// Optional post-extraction string transformation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transform {
+    Trim,
+    Lowercase,
+    Uppercase,
+    /// Extract regex capture group 1.
+    Regex(String),
+    /// Replace `from` with `to`.
+    Replace(String, String),
+    /// Strip non-numeric chars, parse as f64 string.
+    ParseNumber,
+}
+
+/// How the crawler should follow pages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PaginationConfig {
+    NextButton {
+        selector: String,
+    },
+    UrlPattern {
+        /// e.g. `"https://example.com/page/{n}"`
+        template: String,
+        start: u32,
+        end: Option<u32>,
+        step: u32,
+    },
+    InfiniteScroll {
+        /// Pixels from bottom to trigger scroll.
+        trigger_px: u32,
+        /// Maximum scroll iterations.
+        max_scrolls: u32,
+    },
+    LoadMore {
+        button_selector: String,
+        max_clicks: u32,
+    },
+    /// Offset query parameter: `?offset=0`, `?offset=20` …
+    OffsetParam {
+        param_name: String,
+        page_size: u32,
+        max_pages: Option<u32>,
+    },
+}
+
+// ---- Daemon spec ----
+
+/// Daemon-ready config exported after Phase 4.
+/// Fully self-contained — no agent needed at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonSpec {
+    pub name: String,
+    pub domain: String,
+    pub seed_urls: Vec<String>,
+    pub site_profile: SiteProfile,
+    pub schedule: CronSchedule,
+    pub fetch_method: FetchMethod,
+    pub rate_limit: RateLimitConfig,
+    pub output_format: OutputFormat,
+    pub created_at: DateTime<Utc>,
+    /// Semver string, e.g. `"1.0"`.
+    pub spec_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronSchedule {
+    /// Standard 5-field cron expression.
+    pub expression: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    pub requests_per_second: f64,
+    pub min_delay_ms: u64,
+    pub concurrent_requests: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    Jsonl,
+    Json,
+    Csv,
+    Sqlite,
+}

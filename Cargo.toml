@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 
 [workspace.dependencies]
@@ -30,12 +30,15 @@ csv            = "1.3"
 regex          = "1"
 clap           = { version = "4", features = ["derive"] }
 tempfile       = "3"
+rand           = "0.8"
 dig2browser    = { path = "../dig2browser" }
 
-crawl-core     = { path = "crates/core" }
-crawl-fetch    = { path = "crates/fetch" }
-crawl-agent    = { path = "crates/agent" }
-crawl-storage  = { path = "crates/storage" }
+crawl-core          = { path = "crates/core" }
+crawl-fetch         = { path = "crates/fetch" }
+crawl-agent         = { path = "crates/agent" }
+crawl-storage       = { path = "crates/storage" }
+dig2crawl-config    = { path = "crates/config" }
+dig2crawl-parser    = { path = "crates/parser" }
 
 [package]
 name = "dig2crawl"
@@ -51,6 +54,8 @@ crawl-core.workspace = true
 crawl-fetch.workspace = true
 crawl-agent.workspace = true
 crawl-storage.workspace = true
+dig2crawl-parser.workspace = true
+dig2crawl-config.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
@@ -58,6 +63,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 chrono.workspace = true
+url.workspace = true
 dig2browser.workspace = true
 rusqlite.workspace = true
+toml.workspace = true
