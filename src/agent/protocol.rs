@@ -35,7 +35,7 @@ pub struct AgentResponse {
     #[serde(default)]
     pub records: Vec<serde_json::Value>,
     #[serde(default)]
-    pub next_urls: Vec<NextUrl>,
+    pub next_urls: Vec<NextUrlEntry>,
     pub updated_memory: Option<SiteMemorySnapshot>,
     pub confidence: Option<f32>,
     #[serde(default)]
@@ -66,13 +66,79 @@ pub enum AgentStatus {
     PartialSuccess,
     NoData,
     Failed,
+    Blocked,
+    Error,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NextUrl {
     pub url: String,
     pub priority: String,
     pub reason: String,
+}
+
+/// Accepts either a plain URL string or a full `NextUrl` object.
+///
+/// Claude sometimes returns `"next_urls": ["https://..."]` instead of the
+/// structured form. This enum handles both via `#[serde(untagged)]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NextUrlEntry {
+    /// Plain string: `"https://example.com/page2"`
+    Simple(String),
+    /// Full object: `{"url": "...", "priority": "high", "reason": "..."}`
+    Full(NextUrl),
+}
+
+impl NextUrlEntry {
+    /// Convert into a `NextUrl`, supplying defaults for the simple case.
+    pub fn into_next_url(self) -> NextUrl {
+        match self {
+            NextUrlEntry::Simple(url) => NextUrl {
+                url,
+                priority: "normal".to_string(),
+                reason: String::new(),
+            },
+            NextUrlEntry::Full(n) => n,
+        }
+    }
+
+    /// Borrow the URL string regardless of variant.
+    pub fn url(&self) -> &str {
+        match self {
+            NextUrlEntry::Simple(u) => u,
+            NextUrlEntry::Full(n) => &n.url,
+        }
+    }
+}
+
+/// A URL pattern value in site memory — Claude may return either a single string
+/// or a list of strings for the same key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UrlPattern {
+    /// Single URL or URL template: `"https://example.com/page/{n}"`
+    Single(String),
+    /// Multiple URLs or templates: `["https://example.com/a", "https://example.com/b"]`
+    Multiple(Vec<String>),
+}
+
+impl UrlPattern {
+    /// Return all URLs contained in this pattern as an owned `Vec<String>`.
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            UrlPattern::Single(s) => vec![s],
+            UrlPattern::Multiple(v) => v,
+        }
+    }
+
+    /// Iterate over URL strings without consuming `self`.
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            UrlPattern::Single(s) => std::slice::from_ref(s),
+            UrlPattern::Multiple(v) => v.as_slice(),
+        }
+    }
 }
 
 /// Per-domain knowledge accumulated by the agent.
@@ -80,7 +146,7 @@ pub struct NextUrl {
 pub struct SiteMemorySnapshot {
     pub domain: String,
     pub selectors: HashMap<String, LearnedSelectors>,
-    pub url_patterns: HashMap<String, String>,
+    pub url_patterns: HashMap<String, UrlPattern>,
     pub pages_seen: usize,
     pub records_found: usize,
     pub requires_browser: bool,
@@ -106,7 +172,8 @@ pub struct SiteMemorySnapshot {
 pub struct LearnedSelectors {
     pub container_selector: Option<String>,
     /// v1: flat map from field name → CSS selector string.
-    pub fields: HashMap<String, String>,
+    /// Claude may also return richer objects here — we accept any JSON value.
+    pub fields: HashMap<String, serde_json::Value>,
     pub confidence: f32,
     pub validated_on_pages: usize,
 }
@@ -122,7 +189,9 @@ pub struct FieldConfig {
     /// Name of the field as specified in the original goal.
     pub name: String,
     /// CSS selector targeting the element that holds this field's value.
-    pub selector: String,
+    /// `None` when Claude could not find a matching element on the page —
+    /// the field should be skipped during extraction in that case.
+    pub selector: Option<String>,
     /// How to read the value from the matched element.
     pub extract: ExtractMode,
     /// Prepend this string to the extracted value (e.g. domain for relative URLs).

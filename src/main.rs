@@ -221,10 +221,83 @@ async fn fetch_page(
 /// Parse the raw agent response string into `AgentResponse`.
 ///
 /// Claude sometimes wraps JSON in a markdown code fence — we strip those.
+/// The sanitizer also fixes invalid JSON escape sequences (e.g. `\d`, `\s`)
+/// that Claude emits inside regex strings.
 fn parse_agent_response(raw: &str) -> Result<dig2crawl::agent::protocol::AgentResponse> {
     let json_str = extract_json_block(raw);
-    serde_json::from_str(json_str)
-        .with_context(|| format!("Failed to parse agent response as JSON:\n{json_str}"))
+    let sanitized = sanitize_json_escapes(json_str);
+    serde_json::from_str(&sanitized)
+        .with_context(|| format!("Failed to parse agent response as JSON:\n{sanitized}"))
+}
+
+/// Fix invalid JSON escape sequences that Claude sometimes emits inside strings.
+///
+/// JSON only allows `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\uXXXX`.
+/// Any other `\x` sequence (e.g. `\d`, `\s`, `\w` from regex patterns) is invalid
+/// and will cause `serde_json` to reject the document.
+///
+/// This function scans the raw JSON text character-by-character.  When inside a
+/// JSON string it doubles any backslash that is followed by an unrecognised escape
+/// character, turning `\d` → `\\d` so the string survives round-trip through the
+/// JSON parser unchanged.
+fn sanitize_json_escapes(s: &str) -> String {
+    /// Characters that are valid immediately after `\` in a JSON string.
+    fn is_valid_json_escape(c: char) -> bool {
+        matches!(c, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')
+    }
+
+    let mut out = String::with_capacity(s.len() + 32);
+    let mut chars = s.chars().peekable();
+    // Track whether we are currently inside a JSON string literal.
+    let mut in_string = false;
+
+    while let Some(c) = chars.next() {
+        match c {
+            // Toggle string-mode on unescaped double-quotes.
+            '"' if !in_string => {
+                in_string = true;
+                out.push(c);
+            }
+            '"' if in_string => {
+                in_string = false;
+                out.push(c);
+            }
+            // Inside a string: inspect every backslash.
+            '\\' if in_string => {
+                match chars.peek().copied() {
+                    Some(next) if is_valid_json_escape(next) => {
+                        // Valid escape — emit as-is.
+                        out.push('\\');
+                        // `\uXXXX` — also consume the four hex digits so the
+                        // peek-based state machine stays in sync.
+                        if next == 'u' {
+                            out.push(chars.next().unwrap()); // 'u'
+                            for _ in 0..4 {
+                                if let Some(h) = chars.next() {
+                                    out.push(h);
+                                }
+                            }
+                        }
+                        // For all other valid escapes the next iteration handles
+                        // the escaped character naturally.
+                    }
+                    Some(_) => {
+                        // Invalid escape: double the backslash so the sequence
+                        // becomes a literal backslash followed by the character.
+                        out.push('\\');
+                        out.push('\\');
+                    }
+                    None => {
+                        // Trailing backslash — pass through unchanged.
+                        out.push('\\');
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+
+    out
 }
 
 /// Extract the first JSON object from a string that may contain markdown fences.
@@ -276,9 +349,10 @@ fn build_site_profile(
         response
             .field_configs
             .iter()
+            .filter(|fc| fc.selector.is_some())
             .map(|fc| FieldConfig {
                 name: fc.name.clone(),
-                selector: fc.selector.clone(),
+                selector: fc.selector.clone().unwrap_or_default(),
                 extract: match &fc.extract {
                     dig2crawl::agent::protocol::ExtractMode::Text => ExtractMode::Text,
                     dig2crawl::agent::protocol::ExtractMode::Attribute(a) => {
@@ -316,12 +390,21 @@ fn build_site_profile(
             .map(|s| {
                 s.fields
                     .iter()
-                    .map(|(name, sel)| FieldConfig {
-                        name: name.clone(),
-                        selector: sel.clone(),
-                        extract: ExtractMode::Text,
-                        prefix: None,
-                        transform: None,
+                    .filter_map(|(name, sel)| {
+                        let selector_str = match sel {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            serde_json::Value::Object(obj) => {
+                                obj.get("selector").and_then(|v| v.as_str()).map(|s| s.to_string())
+                            }
+                            _ => None,
+                        };
+                        selector_str.map(|s| FieldConfig {
+                            name: name.clone(),
+                            selector: s,
+                            extract: ExtractMode::Text,
+                            prefix: None,
+                            transform: None,
+                        })
                     })
                     .collect()
             })

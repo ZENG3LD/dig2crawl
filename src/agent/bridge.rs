@@ -119,7 +119,8 @@ impl CrawlAgent for AgentBridge {
             let next_urls: Vec<QueuedUrl> = response
                 .next_urls
                 .into_iter()
-                .filter_map(|nu| {
+                .filter_map(|entry| {
+                    let nu = entry.into_next_url();
                     let url = Url::parse(&nu.url).ok()?;
                     let priority = match nu.priority.as_str() {
                         "high" => Priority::High,
