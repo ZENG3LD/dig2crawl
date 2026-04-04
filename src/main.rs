@@ -351,7 +351,7 @@ async fn cmd_discover(
     goal: String,
     browser: bool,
     wait_selector: Option<String>,
-    model: String,
+    _model: String,
     output_dir: Option<PathBuf>,
 ) -> Result<()> {
     println!("Discovering site structure for: {url_str}");
@@ -394,21 +394,25 @@ async fn cmd_discover(
         println!("      Title: {title}");
     }
 
-    // 4. Start AgentSession and send discovery prompt
-    println!("[4/5] Starting Claude session ({model})...");
-    let mut session = crawl_agent::session::AgentSession::start(&model)
+    // 4. Start AgentSession and send discovery prompt (bootstrap file pattern)
+    println!("[4/5] Starting Claude session...");
+    let mut session = crawl_agent::session::AgentSession::start()
         .await
         .context("Failed to start Claude agent session. Is `claude` CLI installed?")?;
 
-    // Build discovery prompt — include truncated HTML (limit to ~50KB for context window)
-    const HTML_LIMIT: usize = 50_000;
-    let html_for_prompt = if page.body.len() > HTML_LIMIT {
-        &page.body[..HTML_LIMIT]
-    } else {
-        &page.body
-    };
+    // Create a per-run job directory in the system temp dir
+    let job_dir = std::env::temp_dir().join(format!("dig2crawl_{}", std::process::id()));
+    tokio::fs::create_dir_all(&job_dir)
+        .await
+        .with_context(|| format!("Failed to create job dir: {}", job_dir.display()))?;
 
-    // Enrich prompt with JSON-LD context if available
+    // Save full HTML to file — Claude will read it with its Read tool
+    let html_path = job_dir.join("page.html");
+    tokio::fs::write(&html_path, &page.body)
+        .await
+        .with_context(|| format!("Failed to write HTML to {}", html_path.display()))?;
+
+    // Enrich goal with JSON-LD context if available
     let jsonld_context = if !jsonld_items.is_empty() {
         let jsonld_str = serde_json::to_string_pretty(&jsonld_items)
             .unwrap_or_default();
@@ -416,15 +420,34 @@ async fn cmd_discover(
     } else {
         String::new()
     };
-
     let full_goal = format!("{goal}{jsonld_context}");
-    let discovery_prompt = crawl_agent::prompts::build_discovery_prompt(html_for_prompt, &full_goal);
 
-    println!("      Sending discovery prompt ({} chars)...", discovery_prompt.len());
-    let discovery_raw = session
-        .send(&discovery_prompt)
+    // Build the discovery prompt that references the HTML file
+    let response_path = job_dir.join("response.json");
+    let discovery_prompt =
+        crawl_agent::prompts::build_discovery_prompt(&html_path, &response_path, &full_goal);
+
+    // Write prompt to file — Claude reads it via bootstrap
+    let prompt_path = job_dir.join("prompt.md");
+    tokio::fs::write(&prompt_path, &discovery_prompt)
+        .await
+        .with_context(|| format!("Failed to write prompt to {}", prompt_path.display()))?;
+
+    println!(
+        "      Sending discovery prompt ({} chars, HTML: {} bytes)...",
+        discovery_prompt.len(),
+        page.body.len(),
+    );
+
+    session
+        .send_with_files(&prompt_path, &response_path)
         .await
         .context("Discovery prompt failed")?;
+
+    // Read response.json written by Claude
+    let discovery_raw = tokio::fs::read_to_string(&response_path)
+        .await
+        .with_context(|| format!("Claude did not write response to {}", response_path.display()))?;
 
     tracing::debug!(response_len = discovery_raw.len(), "Discovery response received");
 
@@ -455,35 +478,51 @@ async fn cmd_discover(
 
     println!("      Extracted {} record(s) with discovered selectors", extracted_records.len());
 
-    // Send validation prompt to Claude (same session)
+    // Send validation prompt to Claude (same session, bootstrap pattern)
     if !extracted_records.is_empty() {
         let snapshot = discovery_response.updated_memory.clone().unwrap_or_default();
         let validation_prompt =
             crawl_agent::prompts::build_validation_prompt(&extracted_records, &snapshot);
 
-        println!("      Sending validation prompt...");
-        let validation_raw = session
-            .send(&validation_prompt)
+        // Write validation prompt + output path to files
+        let validation_response_path = job_dir.join("validation_response.json");
+        let validation_prompt_with_output = format!(
+            "{validation_prompt}\n\n---\n\nWrite your JSON response to: {}",
+            validation_response_path.display(),
+        );
+        let validation_prompt_path = job_dir.join("validation_prompt.md");
+        tokio::fs::write(&validation_prompt_path, &validation_prompt_with_output)
             .await
-            .context("Validation prompt failed")?;
+            .with_context(|| format!("Failed to write validation prompt to {}", validation_prompt_path.display()))?;
 
-        if let Ok(validation_response) = parse_agent_response(&validation_raw) {
-            if let Some(vr) = &validation_response.validation_result {
-                println!(
-                    "      Validation: {} — {} items extracted, confidence {:.2}",
-                    if vr.passed { "PASSED" } else { "FAILED" },
-                    vr.items_extracted,
-                    vr.confidence,
-                );
-                if !vr.issues.is_empty() {
-                    println!("      Issues:");
-                    for issue in &vr.issues {
-                        println!("        - {issue}");
+        println!("      Sending validation prompt...");
+        if session
+            .send_with_files(&validation_prompt_path, &validation_response_path)
+            .await
+            .is_ok()
+        {
+            let validation_raw = tokio::fs::read_to_string(&validation_response_path)
+                .await
+                .unwrap_or_default();
+
+            if let Ok(validation_response) = parse_agent_response(&validation_raw) {
+                if let Some(vr) = &validation_response.validation_result {
+                    println!(
+                        "      Validation: {} — {} items extracted, confidence {:.2}",
+                        if vr.passed { "PASSED" } else { "FAILED" },
+                        vr.items_extracted,
+                        vr.confidence,
+                    );
+                    if !vr.issues.is_empty() {
+                        println!("      Issues:");
+                        for issue in &vr.issues {
+                            println!("        - {issue}");
+                        }
                     }
-                }
-                profile.validated = vr.passed;
-                if vr.confidence > 0.0 {
-                    profile.confidence = vr.confidence as f64;
+                    profile.validated = vr.passed;
+                    if vr.confidence > 0.0 {
+                        profile.confidence = vr.confidence as f64;
+                    }
                 }
             }
         }
@@ -492,6 +531,9 @@ async fn cmd_discover(
     }
 
     session.close().await;
+
+    // Clean up temp job dir
+    let _ = tokio::fs::remove_dir_all(&job_dir).await;
 
     // Save profile
     let out_dir = output_dir.unwrap_or_else(|| PathBuf::from("output").join(&domain));

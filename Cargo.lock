@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "crawl-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "crawl-core",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "crawl-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "chrono",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "crawl-fetch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "crawl-core",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "crawl-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "chrono",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "dig2crawl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "dig2crawl-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "crawl-core",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "dig2crawl-parser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crawl-core",
  "regex",

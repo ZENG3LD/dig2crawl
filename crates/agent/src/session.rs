@@ -1,240 +1,239 @@
 use crawl_core::error::AgentError;
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::Command;
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-/// Delimiter written by the session to mark the end of a response.
-/// Claude CLI in interactive mode outputs each response followed by a blank line
-/// and the prompt string — we use a sentinel we inject instead.
-const RESPONSE_SENTINEL: &str = "\x00END_OF_RESPONSE\x00";
+/// Default per-send() timeout in seconds (10 min for discovery with many tool turns).
+const DEFAULT_SEND_TIMEOUT_SECS: u64 = 600;
 
-/// Default per-send() timeout in seconds.
-const DEFAULT_SEND_TIMEOUT_SECS: u64 = 300;
-
-/// A persistent multi-turn Claude CLI process.
+/// A multi-turn Claude CLI session backed by the bootstrap file pattern.
 ///
-/// Spawns `claude` once and keeps stdin/stdout open across multiple `send()` calls.
-/// This lets the process accumulate conversational context, which is critical for
-/// the discovery→validation flow: Phase 1 discovers selectors, Phase 2 validates
-/// them — and Phase 2 can reference Phase 1 reasoning without resending the full HTML.
+/// Each `send()` call:
+/// 1. Writes the full prompt to `<temp>/dig2crawl_<pid>/prompt.md`
+/// 2. Writes the expected output path to `<temp>/dig2crawl_<pid>/response.json`
+/// 3. Runs `claude --dangerously-skip-permissions -p "<short bootstrap>"` where
+///    the bootstrap instructs Claude to read `prompt.md` and write JSON to `response.json`
+/// 4. Reads `response.json` from disk after the process exits
+///
+/// This avoids Windows cmd.exe argument-length limits (8191 chars) by keeping
+/// the `-p` argument under 300 bytes and storing the real prompt in a file.
+///
+/// On subsequent calls `--resume <session_id>` is passed so Claude retains
+/// full conversational context.
 ///
 /// # Example
 /// ```no_run
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let mut session = AgentSession::start("claude-sonnet-4-6").await?;
-/// let discovery = session.send("Here is the HTML: ... Find selectors.").await?;
-/// let validation = session.send("Now validate: does selector div.item work?").await?;
-/// session.close().await;
+/// use std::path::Path;
+/// let mut session = crawl_agent::session::AgentSession::start().await?;
+/// let raw = session.send_with_files(
+///     Path::new("/tmp/prompt.md"),
+///     Path::new("/tmp/response.json"),
+/// ).await?;
 /// # Ok(())
 /// # }
 /// ```
 pub struct AgentSession {
-    process: Child,
-    stdin: ChildStdin,
-    stdout_lines: BufReader<ChildStdout>,
-    model: String,
+    claude_bin: PathBuf,
+    session_id: Option<String>,
     timeout_secs: u64,
 }
 
 impl AgentSession {
-    /// Spawn a new persistent claude CLI process.
+    /// Locate the claude CLI binary and create a session handle.
     ///
-    /// The process is started with `--dangerously-skip-permissions` so it can use
-    /// tools (Read, etc.) during extraction without prompting for confirmation.
-    pub async fn start(model: &str) -> Result<Self, AgentError> {
-        Self::start_with_bin(PathBuf::from("claude"), model).await
+    /// No process is spawned here. The binary is located by trying common
+    /// installation paths. Returns an error if none are found.
+    pub async fn start() -> Result<Self, AgentError> {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default();
+
+        let mut candidates = vec![
+            PathBuf::from("claude"),
+            PathBuf::from("claude.cmd"),
+        ];
+        if !home.is_empty() {
+            let h = PathBuf::from(&home);
+            candidates.push(h.join("AppData/Roaming/npm/claude.cmd"));
+            candidates.push(h.join("AppData/Roaming/npm/claude"));
+            candidates.push(h.join(".local/bin/claude"));
+        }
+        candidates.push(PathBuf::from("/usr/local/bin/claude"));
+
+        for bin in candidates {
+            if Self::probe_bin(&bin).await {
+                info!(binary = %bin.display(), "AgentSession ready");
+                return Ok(Self {
+                    claude_bin: bin,
+                    session_id: None,
+                    timeout_secs: DEFAULT_SEND_TIMEOUT_SECS,
+                });
+            }
+        }
+
+        Err(AgentError::Spawn(
+            "claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code".into(),
+        ))
     }
 
-    /// Same as `start` but with an explicit binary path.
-    pub async fn start_with_bin(claude_bin: PathBuf, model: &str) -> Result<Self, AgentError> {
-        debug!(model, "Starting persistent AgentSession");
-
-        let mut child = Command::new(&claude_bin)
-            .arg("--model")
-            .arg(model)
-            .arg("--dangerously-skip-permissions")
-            .arg("--output-format")
-            .arg("stream-json")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| AgentError::Spawn(format!("failed to spawn claude: {e}")))?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| AgentError::Spawn("claude stdin not available".to_string()))?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| AgentError::Spawn("claude stdout not available".to_string()))?;
-
-        info!(model, "AgentSession started");
-
+    /// Same as `start` but with an explicit binary path, skipping discovery.
+    pub async fn start_with_bin(claude_bin: PathBuf) -> Result<Self, AgentError> {
+        if !Self::probe_bin(&claude_bin).await {
+            return Err(AgentError::Spawn(format!(
+                "claude binary not executable: {}",
+                claude_bin.display()
+            )));
+        }
+        info!(binary = %claude_bin.display(), "AgentSession ready");
         Ok(Self {
-            process: child,
-            stdin,
-            stdout_lines: BufReader::new(stdout),
-            model: model.to_string(),
+            claude_bin,
+            session_id: None,
             timeout_secs: DEFAULT_SEND_TIMEOUT_SECS,
         })
     }
 
-    /// Override the per-send() timeout (default: 300 s).
+    /// Override the per-send() timeout (default: 600 s).
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
         self
     }
 
-    /// Send a prompt and wait for the complete response.
+    /// Send a prompt using the bootstrap file pattern.
     ///
-    /// The session stays alive after this call — the next `send()` will continue
-    /// the same conversation thread, with Claude retaining full prior context.
+    /// - `prompt_path`: path to the prompt file that Claude will read with its Read tool
+    /// - `response_path`: path where Claude must write its JSON response
     ///
-    /// Each prompt is written to stdin as a single line terminated with the sentinel
-    /// instruction. The reader collects stdout lines until it sees `RESPONSE_SENTINEL`.
-    pub async fn send(&mut self, prompt: &str) -> Result<String, AgentError> {
-        debug!(model = %self.model, prompt_len = prompt.len(), "AgentSession::send");
-
-        // Write the prompt followed by an instruction to emit our sentinel when done.
-        let message = format!(
-            "{}\n\nWhen you have finished your complete response, output exactly this line on its own: {}\n",
-            prompt, RESPONSE_SENTINEL
+    /// The caller is responsible for writing `prompt_path` before calling this method.
+    /// After this returns `Ok(())`, the caller should read `response_path` from disk.
+    ///
+    /// On the first call a fresh conversation is started. On subsequent calls
+    /// `--resume <session_id>` is added so Claude retains full prior context.
+    pub async fn send_with_files(
+        &mut self,
+        prompt_path: &std::path::Path,
+        response_path: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        debug!(
+            prompt = %prompt_path.display(),
+            response = %response_path.display(),
+            "AgentSession::send_with_files",
         );
 
+        let secs = self.timeout_secs;
         timeout(
-            std::time::Duration::from_secs(self.timeout_secs),
-            self.do_send(&message),
+            std::time::Duration::from_secs(secs),
+            self.do_send(prompt_path, response_path),
         )
         .await
-        .map_err(|_| AgentError::Timeout { secs: self.timeout_secs })?
+        .map_err(|_| AgentError::Timeout { secs })?
     }
 
-    async fn do_send(&mut self, message: &str) -> Result<String, AgentError> {
-        self.stdin
-            .write_all(message.as_bytes())
+    async fn do_send(
+        &mut self,
+        prompt_path: &std::path::Path,
+        response_path: &std::path::Path,
+    ) -> Result<(), AgentError> {
+        // Short bootstrap prompt — stays well under Windows 8191-char cmd limit.
+        let bootstrap = format!(
+            "Read and execute the instructions in {} — write your JSON response to {}",
+            prompt_path.display(),
+            response_path.display(),
+        );
+        debug!(bootstrap_len = bootstrap.len(), "bootstrap prompt");
+
+        let mut cmd = build_claude_command(&self.claude_bin);
+        cmd.arg("--dangerously-skip-permissions")
+            .arg("-p")
+            .arg(&bootstrap);
+
+        if let Some(id) = &self.session_id {
+            cmd.arg("--resume").arg(id);
+        }
+
+        let output = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
             .await
-            .map_err(|e| AgentError::Spawn(format!("write to claude stdin: {e}")))?;
-        self.stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| AgentError::Spawn(format!("write newline to claude stdin: {e}")))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| AgentError::Spawn(format!("flush claude stdin: {e}")))?;
+            .map_err(|e| AgentError::Spawn(format!("failed to spawn claude: {e}")))?;
 
-        // Read lines until we see the sentinel or stdout closes.
-        let mut response_lines: Vec<String> = Vec::new();
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-            let n = self
-                .stdout_lines
-                .read_line(&mut line)
-                .await
-                .map_err(|e| AgentError::Spawn(format!("read from claude stdout: {e}")))?;
-
-            if n == 0 {
-                // EOF — process exited unexpectedly.
-                warn!("Claude process exited unexpectedly during send()");
-                break;
-            }
-
-            let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-
-            if trimmed == RESPONSE_SENTINEL {
-                break;
-            }
-
-            // stream-json format: each line is a JSON event. Collect all text content.
-            if let Some(text) = extract_text_from_stream_event(trimmed) {
-                response_lines.push(text);
-            } else {
-                // Not a recognised event — include the raw line so callers can debug.
-                if !trimmed.is_empty() {
-                    response_lines.push(trimmed.to_string());
-                }
+        // Extract session_id from stdout if present (--output-format json not used here,
+        // but Claude may still print it; we attempt a best-effort parse).
+        if let Ok(stdout) = std::str::from_utf8(&output.stdout) {
+            if let Some(id) = extract_session_id(stdout) {
+                self.session_id = Some(id);
             }
         }
 
-        let response = response_lines.join("");
-        debug!(response_len = response.len(), "AgentSession::send complete");
-        Ok(response)
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(AgentError::ProcessFailed(format!(
+                "claude exited with {}: stderr={stderr} stdout={stdout}",
+                output.status
+            )));
+        }
+
+        debug!("AgentSession::do_send complete");
+        Ok(())
     }
 
-    /// Kill the claude process and release resources.
-    pub async fn close(mut self) {
-        drop(self.stdin);
-        let _ = self.process.kill().await;
-        let _ = self.process.wait().await;
-        info!(model = %self.model, "AgentSession closed");
+    /// No-op — there is no persistent process to kill.
+    pub async fn close(self) {
+        info!("AgentSession closed");
     }
 
-    /// Returns a reference to the model string used by this session.
-    pub fn model(&self) -> &str {
-        &self.model
+    /// Returns the session_id from the last successful send, if any.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Check whether a binary path is executable by asking for its version.
+    async fn probe_bin(bin: &PathBuf) -> bool {
+        Command::new(bin)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
 
-/// Extract human-readable text from a single `stream-json` line emitted by claude CLI.
+/// Build a `tokio::process::Command` for the claude CLI.
 ///
-/// The stream-json format emits newline-delimited JSON objects of the form:
-/// `{"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}`
-///
-/// We extract the `text` field from `text_delta` events; all other event types are
-/// silently ignored (they carry metadata, not response content).
-fn extract_text_from_stream_event(line: &str) -> Option<String> {
-    // Fast reject: skip lines that are clearly not our target event type.
-    if !line.contains("text_delta") {
-        return None;
+/// On Windows we invoke `cmd /C claude` so that `.cmd` batch wrappers are
+/// resolved correctly by the shell (same approach as zengeld-crawler).
+fn build_claude_command(bin: &PathBuf) -> Command {
+    if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(bin);
+        cmd
+    } else {
+        Command::new(bin)
     }
-
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-
-    let delta = v.get("delta")?;
-    let delta_type = delta.get("type")?.as_str()?;
-
-    if delta_type != "text_delta" {
-        return None;
-    }
-
-    delta.get("text")?.as_str().map(|s| s.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_text_from_text_delta() {
-        let line = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello world"}}"#;
-        let result = extract_text_from_stream_event(line);
-        assert_eq!(result, Some("Hello world".to_string()));
+/// Try to extract a `session_id` from Claude CLI stdout.
+///
+/// When run with `--output-format json` Claude prints `{"session_id":"...","result":"..."}`.
+/// Without that flag the output is prose; we do a best-effort JSON parse.
+fn extract_session_id(stdout: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Partial {
+        session_id: String,
     }
-
-    #[test]
-    fn test_extract_text_ignores_non_text_events() {
-        let line = r#"{"type":"message_start","message":{"id":"msg_01","type":"message"}}"#;
-        let result = extract_text_from_stream_event(line);
-        assert_eq!(result, None);
+    // Try each non-empty line that starts with '{'
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.starts_with('{') {
+            if let Ok(p) = serde_json::from_str::<Partial>(line) {
+                return Some(p.session_id);
+            }
+        }
     }
-
-    #[test]
-    fn test_extract_text_ignores_input_json_delta() {
-        let line = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{"}}"#;
-        let result = extract_text_from_stream_event(line);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_extract_text_empty_line() {
-        let result = extract_text_from_stream_event("");
-        assert_eq!(result, None);
-    }
+    None
 }

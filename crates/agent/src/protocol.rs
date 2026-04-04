@@ -62,9 +62,10 @@ pub struct AgentResponse {
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Success,
+    Partial,
     PartialSuccess,
     NoData,
-    Failed { reason: String },
+    Failed,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

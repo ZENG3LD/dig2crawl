@@ -1,5 +1,6 @@
 use crate::protocol::SiteMemorySnapshot;
 use serde_json::Value;
+use std::path::Path;
 
 // ── System prompt (v1, unchanged — used by ClaudeSpawner one-shot mode) ──────
 
@@ -71,33 +72,31 @@ Your response MUST be a single valid JSON object:
 
 /// Build a Phase 1 (discovery) prompt for `AgentSession`.
 ///
-/// The prompt instructs Claude to analyse the provided HTML and return a JSON
-/// object describing: the container selector, per-field selectors with extraction
-/// modes, and the pagination pattern (if any).
+/// The prompt is written to a file (not inlined). Claude reads the HTML file
+/// at `html_path` using its Read tool, analyses the DOM, and writes its JSON
+/// response to `output_path`.
 ///
-/// The response must conform to the v2 `AgentResponse` JSON shape so it can be
-/// parsed by `ClaudeSpawner::parse_response` without modification.
-pub fn build_discovery_prompt(html: &str, goal: &str) -> String {
+/// This file-based approach avoids Windows cmd.exe argument-length limits and
+/// lets Claude use its native Read/Write tools rather than receiving huge stdin blobs.
+pub fn build_discovery_prompt(html_path: &Path, output_path: &Path, goal: &str) -> String {
     format!(
         r#"You are a CSS selector discovery agent. Your task is to analyse HTML and find precise selectors for structured data extraction.
 
 ## Goal
 {goal}
 
-## HTML to analyse
-```html
-{html}
-```
+## Instructions
 
-## Your task
-
-1. Find the CSS selector for the **repeating container** element that wraps each individual item (e.g. a product card, a job listing, an article summary).
-2. For each requested field, find the CSS selector **relative to the container** and determine the best extraction mode.
-3. Identify the pagination pattern if one exists.
+1. Use the Read tool to read the HTML file at: {html_path}
+2. Analyse the DOM structure — look for repeating elements, JSON-LD, data attributes, class patterns.
+3. Find the CSS selector for the **repeating container** element that wraps each individual item (e.g. a product card, a job listing, an article summary).
+4. For each requested field, find the CSS selector **relative to the container** and determine the best extraction mode.
+5. Identify the pagination pattern if one exists.
+6. Use the Write tool to write your JSON response to: {output_path}
 
 ## Response format
 
-Return ONLY a single valid JSON object — no prose, no markdown, no explanation:
+Write ONLY a single valid JSON object to {output_path} — no prose, no markdown, no explanation:
 
 ```json
 {{
@@ -117,6 +116,22 @@ Return ONLY a single valid JSON object — no prose, no markdown, no explanation
       "transform": null
     }}
   ],
+  "updated_memory": {{
+    "domain": "<domain>",
+    "selectors": {{
+      "listing": {{
+        "container_selector": "<container CSS selector>",
+        "fields": {{}},
+        "confidence": 0.85,
+        "validated_on_pages": 0
+      }}
+    }},
+    "url_patterns": {{}},
+    "pages_seen": 1,
+    "records_found": 0,
+    "requires_browser": false,
+    "notes": []
+  }},
   "pagination": {{
     "type": "next_button",
     "selector": "a.next-page"
@@ -146,11 +161,15 @@ Return ONLY a single valid JSON object — no prose, no markdown, no explanation
 - omit the `"pagination"` key entirely if there is no pagination
 
 ## Rules
+- Read the HTML file first — do NOT rely on memory or guesses.
 - Container selector must match ALL items on the page, not just one.
 - Field selectors must be relative to the container element.
-- Only include fields that are present in the HTML. Use null confidence values (0.0) for fields you could not find.
+- Only include fields that are present in the HTML. Use confidence 0.0 for fields you could not find.
 - Do not hallucinate selectors. If unsure, set a lower confidence value.
-- Return exactly one JSON object. Nothing else."#
+- Write exactly one JSON object to {output_path}. Nothing else."#,
+        html_path = html_path.display(),
+        output_path = output_path.display(),
+        goal = goal,
     )
 }
 
