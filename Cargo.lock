@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "dig2crawl"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "anyhow",
