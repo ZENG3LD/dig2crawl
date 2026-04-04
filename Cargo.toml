@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.2.2"
+version = "0.2.3"
 license = "MIT"
 
 [workspace.dependencies]
@@ -31,19 +31,22 @@ regex          = "1"
 clap           = { version = "4", features = ["derive"] }
 tempfile       = "3"
 rand           = "0.8"
-dig2browser    = { path = "../dig2browser" }
+dig2browser    = { path = "../dig2browser", version = "0.3.3" }
 
-crawl-core          = { path = "crates/core" }
-crawl-fetch         = { path = "crates/fetch" }
-crawl-agent         = { path = "crates/agent" }
-crawl-storage       = { path = "crates/storage" }
-dig2crawl-config    = { path = "crates/config" }
-dig2crawl-parser    = { path = "crates/parser" }
+crawl-core          = { path = "crates/core",    version = "0.2.3" }
+crawl-fetch         = { path = "crates/fetch",   version = "0.2.3" }
+crawl-agent         = { path = "crates/agent",   version = "0.2.3" }
+crawl-storage       = { path = "crates/storage", version = "0.2.3" }
+dig2crawl-config    = { path = "crates/config",  version = "0.2.3" }
+dig2crawl-parser    = { path = "crates/parser",  version = "0.2.3" }
 
 [package]
 name = "dig2crawl"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
+description = "Universal agnostic web crawler with Claude-powered CSS selector discovery"
+repository = "https://github.com/ZENG3LD/dig2crawl"
 
 [[bin]]
 name = "dig2crawl"

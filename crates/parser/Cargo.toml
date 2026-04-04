@@ -3,6 +3,8 @@ name = "dig2crawl-parser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "HTML parser, selector extractor, and metadata extraction for dig2crawl"
+repository = "https://github.com/ZENG3LD/dig2crawl"
 
 [dependencies]
 scraper     = { version = "0.22" }
