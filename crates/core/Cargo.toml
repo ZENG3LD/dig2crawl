@@ -1,0 +1,21 @@
+[package]
+name = "crawl-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+smol_str.workspace = true
+ahash.workspace = true
+scraper.workspace = true
+regex.workspace = true
+toml.workspace = true
+governor.workspace = true
+futures.workspace = true

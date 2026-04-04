@@ -1,0 +1,19 @@
+[package]
+name = "crawl-storage"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+crawl-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+csv.workspace = true
+url.workspace = true
+futures.workspace = true
+ahash.workspace = true
