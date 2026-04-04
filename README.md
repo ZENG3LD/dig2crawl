@@ -141,3 +141,19 @@ cargo build --release --bin dig2crawl
 | clap | CLI framework |
 | governor | Rate limiter |
 | tokio | Async runtime |
+
+## Support the Project
+
+If you find this tool useful, consider supporting development:
+
+| Currency | Network | Address |
+|----------|---------|---------|
+| USDT | TRC20 | `TNxMKsvVLYViQ5X5sgCYmkzH4qjhhh5U7X` |
+| USDC | Arbitrum | `0xEF3B94Fe845E21371b4C4C5F2032E1f23A13Aa6e` |
+| ETH | Ethereum | `0xEF3B94Fe845E21371b4C4C5F2032E1f23A13Aa6e` |
+| BTC | Bitcoin | `bc1qjgzthxja8umt5tvrp5tfcf9zeepmhn0f6mnt40` |
+| SOL | Solana | `DZJjmH8Cs5wEafz5Ua86wBBkurSA4xdWXa3LWnBUR94c` |
+
+## License
+
+MIT
