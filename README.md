@@ -17,16 +17,19 @@ reusable config for machine-loop extraction without any agent involvement.
 
 ## Architecture
 
+Single-crate layout — all modules live under `src/`:
+
 ```
 dig2crawl/
-├── crates/
-│   ├── core/      — types (SiteProfile, DaemonSpec, FetchedPage), traits, error types, rate limiter
-│   ├── fetch/     — HttpFetcher (reqwest) + BrowserFetcher (dig2browser stealth CDP/BiDi)
+├── src/
+│   ├── main.rs    — CLI binary (clap)
+│   ├── lib.rs     — Library root
+│   ├── core/      — Types, traits, error types, rate limiter, engine
+│   ├── fetch/     — HttpFetcher (reqwest) + BrowserFetcher (dig2browser stealth)
 │   ├── agent/     — AgentSession (Claude CLI bridge), prompts (discovery + validation)
 │   ├── parser/    — SelectorExtractor, JsonLdExtractor, AntiBotDetector, MetadataExtractor, LinkExtractor
 │   ├── config/    — TOML job config, SiteProfile, DaemonSpec serialisation
 │   └── storage/   — SQLite + JSONL output backends
-└── src/main.rs    — CLI binary (clap)
 ```
 
 ## How it works
@@ -40,6 +43,17 @@ Discovery runs in 5 steps:
 5. **Save** — `SiteProfile` is written to `output/<domain>/profile.json`; temp files are removed
 
 After discovery, `extract` applies the saved profile in pure Rust — no agent needed.
+
+## Browser mode
+
+Pass `--browser` to fetch through dig2browser — a stealth headless Chrome driver.
+
+- Uses CDP/BiDi with stealth scripts that patch `navigator.webdriver` and related fingerprint vectors
+- Bypasses Cloudflare and other WAF challenges that block plain HTTP clients
+- Waits for a CSS selector to appear before capturing HTML (`--wait-selector`)
+- Required for sites with JS-rendered pricing tables (e.g. ruvds.com, hostkey.com, ishosting.com)
+
+Without `--browser`, dig2crawl uses a plain `reqwest` HTTP client, which is faster and sufficient for static or server-rendered pages.
 
 ## CLI
 
@@ -91,6 +105,27 @@ Global flag: `--verbose` / `-v` enables debug logging.
 
 The directory is deleted when the session closes.
 
+**Robust JSON parsing** — the agent protocol tolerates several classes of model output variation:
+
+- Regex escape sequences in `transform` patterns (e.g. `\\d+`) parsed without double-escape errors
+- `null` selectors for fields absent from the page (skipped gracefully, not treated as errors)
+- Untagged `next_urls` values — accepted as either a plain string or a `{"url": "..."}` object
+- Mixed-type `url_patterns` and field specs — arrays and scalars both accepted at every field
+
+## Batch crawl results
+
+Tested against 18 L2 (bare-metal / VPS) hosting providers to profile pricing pages.
+
+| Metric | Result |
+|--------|--------|
+| Providers attempted | 18 |
+| Successfully profiled | 16 |
+| Validated (confidence >= 0.55) | 15 |
+| Average confidence | ~0.80 |
+| Recovered via browser mode | 3 (ruvds.com, hostkey.com, ishosting.com) |
+
+Sites that required `--browser` had JS-rendered pricing grids that returned empty containers under plain HTTP. Browser mode resolved all three.
+
 ## Output
 
 ```
@@ -134,7 +169,7 @@ cargo build --release --bin dig2crawl
 
 | Crate | Purpose |
 |-------|---------|
-| dig2browser | Stealth browser automation (CDP + BiDi) |
+| dig2browser | Stealth browser automation (CDP + BiDi) — crates.io |
 | scraper | CSS selector engine |
 | reqwest | HTTP client |
 | rusqlite | SQLite storage |
