@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -12,6 +13,14 @@ struct Cli {
     /// Enable verbose (debug) logging
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Enable Web Bot Auth signing with this JWKS URL
+    #[arg(long, global = true)]
+    bot_auth: Option<String>,
+
+    /// Path to Ed25519 private key for bot auth (default: keys/bot.key)
+    #[arg(long, global = true, default_value = "keys/bot.key")]
+    bot_key: String,
 }
 
 #[derive(Subcommand)]
@@ -132,6 +141,21 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    let signer: Option<Arc<dig2browser::bot_auth::RequestSigner>> =
+        if let Some(jwks_url) = &cli.bot_auth {
+            let identity = dig2browser::bot_auth::BotIdentity::new(
+                "dig2crawl",
+                "https://github.com/ZENG3LD/dig2crawl",
+                jwks_url.clone(),
+                &cli.bot_key,
+            );
+            let s = dig2browser::bot_auth::RequestSigner::from_identity(identity)
+                .context("Failed to initialise bot auth signer")?;
+            Some(Arc::new(s))
+        } else {
+            None
+        };
+
     match cli.command {
         Command::Discover {
             url,
@@ -140,7 +164,7 @@ async fn main() -> Result<()> {
             wait_selector,
             model,
             output_dir,
-        } => cmd_discover(url, goal, browser, wait_selector, model, output_dir).await,
+        } => cmd_discover(url, goal, browser, wait_selector, model, output_dir, signer).await,
 
         Command::Extract {
             url,
@@ -148,7 +172,7 @@ async fn main() -> Result<()> {
             browser,
             max_pages,
             output,
-        } => cmd_extract(url, profile, browser, max_pages, output).await,
+        } => cmd_extract(url, profile, browser, max_pages, output, signer).await,
 
         Command::ExportSpec {
             profile,
@@ -164,21 +188,21 @@ async fn main() -> Result<()> {
             metadata,
             jsonld,
             antibot,
-        } => cmd_fetch(url, browser, wait_selector, output, metadata, jsonld, antibot).await,
+        } => cmd_fetch(url, browser, wait_selector, output, metadata, jsonld, antibot, signer).await,
 
         Command::TestSelector {
             url,
             selector,
             fields,
             browser,
-        } => cmd_test_selector(url, selector, fields, browser).await,
+        } => cmd_test_selector(url, selector, fields, browser, signer).await,
 
         Command::CollectLinks {
             url,
             depth,
             domain_only,
             browser,
-        } => cmd_collect_links(url, depth, domain_only, browser).await,
+        } => cmd_collect_links(url, depth, domain_only, browser, signer).await,
     }
 }
 
@@ -187,12 +211,14 @@ async fn main() -> Result<()> {
 async fn make_fetcher(
     browser: bool,
     wait_selector: Option<String>,
+    signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
 ) -> Result<Box<dyn dig2crawl::core::traits::Fetcher>> {
     if browser {
         let fetcher = dig2crawl::fetch::browser::BrowserFetcher::new(
             1,
             dig2browser::StealthConfig::russian(),
             wait_selector,
+            signer,
         )
         .await
         .context("Failed to start browser")?;
@@ -200,6 +226,7 @@ async fn make_fetcher(
     } else {
         let fetcher = dig2crawl::fetch::http::HttpFetcher::new(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 dig2crawl/0.1",
+            signer,
         )
         .context("Failed to create HTTP client")?;
         Ok(Box::new(fetcher))
@@ -436,6 +463,7 @@ async fn cmd_discover(
     wait_selector: Option<String>,
     _model: String,
     output_dir: Option<PathBuf>,
+    signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
 ) -> Result<()> {
     println!("Discovering site structure for: {url_str}");
     println!("Goal: {goal}");
@@ -443,7 +471,7 @@ async fn cmd_discover(
 
     // 1. Fetch the page
     println!("[1/5] Fetching page...");
-    let fetcher = make_fetcher(browser, wait_selector).await?;
+    let fetcher = make_fetcher(browser, wait_selector, signer).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
     println!(
         "      OK — {} bytes, {}ms",
@@ -657,6 +685,7 @@ async fn cmd_extract(
     browser: bool,
     max_pages: usize,
     output: Option<PathBuf>,
+    signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
 ) -> Result<()> {
     // Load profile
     let profile_json = std::fs::read_to_string(&profile_path)
@@ -664,7 +693,7 @@ async fn cmd_extract(
     let profile: dig2crawl::core::types::SiteProfile = serde_json::from_str(&profile_json)
         .with_context(|| format!("Failed to parse profile: {}", profile_path.display()))?;
 
-    let fetcher = make_fetcher(browser || profile.requires_browser, None).await?;
+    let fetcher = make_fetcher(browser || profile.requires_browser, None, signer).await?;
     let extractor = dig2crawl::parser::SelectorExtractor::new();
 
     let mut all_records: Vec<serde_json::Value> = Vec::new();
@@ -789,8 +818,9 @@ async fn cmd_fetch(
     show_metadata: bool,
     show_jsonld: bool,
     show_antibot: bool,
+    signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
 ) -> Result<()> {
-    let fetcher = make_fetcher(browser, wait_selector).await?;
+    let fetcher = make_fetcher(browser, wait_selector, signer).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
 
     eprintln!(
@@ -857,11 +887,12 @@ async fn cmd_test_selector(
     selector: String,
     field_specs: Vec<String>,
     browser: bool,
+    signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
 ) -> Result<()> {
     use chrono::Utc;
     use dig2crawl::core::types::{ExtractMode, FieldConfig, SiteProfile};
 
-    let fetcher = make_fetcher(browser, None).await?;
+    let fetcher = make_fetcher(browser, None, signer).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
 
     // Parse field specs: "name:css_selector"
@@ -914,10 +945,11 @@ async fn cmd_collect_links(
     depth: usize,
     domain_only: bool,
     browser: bool,
+    signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
 ) -> Result<()> {
     use std::collections::{HashSet, VecDeque};
 
-    let fetcher = make_fetcher(browser, None).await?;
+    let fetcher = make_fetcher(browser, None, signer).await?;
     let parsed_url = url::Url::parse(&url_str)?;
     let seed_domain = parsed_url.host_str().unwrap_or("").to_string();
 

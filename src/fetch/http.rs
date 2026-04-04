@@ -2,6 +2,7 @@ use chrono::Utc;
 use crate::core::error::CrawlError;
 use crate::core::traits::Fetcher;
 use crate::core::types::{FetchMethod, FetchedPage};
+use dig2browser::bot_auth::RequestSigner;
 use futures::future::BoxFuture;
 use reqwest::Client;
 use std::sync::{Arc, Mutex};
@@ -86,6 +87,7 @@ impl HttpFetcherBuilder {
             retry: self.retry,
             cache: self.cache.map(|c| Arc::new(Mutex::new(c))),
             proxy: self.proxy,
+            signer: None,
         })
     }
 }
@@ -99,35 +101,55 @@ impl HttpFetcherBuilder {
 /// - Exponential-backoff **retry** on transient errors (429, 5xx, network failures).
 /// - Simple TTL-based **response cache** (no external deps).
 /// - **Proxy rotation** via a `ProxyPool`.
+/// - **Web Bot Auth signing** via an optional [`RequestSigner`].
 pub struct HttpFetcher {
     client: Client,
     retry: Option<RetryConfig>,
     cache: Option<Arc<Mutex<ResponseCache>>>,
     proxy: Option<ProxyPool>,
+    signer: Option<Arc<RequestSigner>>,
 }
 
 impl HttpFetcher {
     /// Build a new `HttpFetcher` with the given `User-Agent` string and a
     /// 30-second request timeout.  No retry, cache, or proxy is configured.
-    pub fn new(user_agent: &str) -> Result<Self, CrawlError> {
-        HttpFetcherBuilder::new(user_agent).build()
+    ///
+    /// Pass `signer = Some(arc)` to attach Web Bot Auth headers to every request.
+    pub fn new(user_agent: &str, signer: Option<Arc<RequestSigner>>) -> Result<Self, CrawlError> {
+        let mut fetcher = HttpFetcherBuilder::new(user_agent).build()?;
+        fetcher.signer = signer;
+        Ok(fetcher)
     }
 
     /// Build an `HttpFetcher` from an existing `reqwest::Client`.
     ///
-    /// No retry, cache, or proxy is configured.
+    /// No retry, cache, proxy, or signer is configured.
     pub fn with_client(client: Client) -> Self {
         Self {
             client,
             retry: None,
             cache: None,
             proxy: None,
+            signer: None,
         }
     }
 
     /// Return a [`HttpFetcherBuilder`] for full configuration.
     pub fn builder(user_agent: impl Into<String>) -> HttpFetcherBuilder {
         HttpFetcherBuilder::new(user_agent)
+    }
+
+    /// Apply Web Bot Auth headers to a request builder if a signer is configured.
+    fn apply_bot_auth(&self, mut req: reqwest::RequestBuilder, url: &Url) -> reqwest::RequestBuilder {
+        if let Some(signer) = &self.signer {
+            if let Ok(headers) = signer.sign_request("GET", url.as_str()) {
+                req = req
+                    .header("Signature-Agent", &headers.signature_agent)
+                    .header("Signature-Input", &headers.signature_input)
+                    .header("Signature", &headers.signature);
+            }
+        }
+        req
     }
 
     /// Perform a single GET request without retry.
@@ -146,21 +168,19 @@ impl HttpFetcher {
                     .proxy(proxy)
                     .build()
                     .map_err(|e| CrawlError::Fetch(e.to_string()))?;
-                tmp.get(url.as_str())
-                    .send()
+                let req = self.apply_bot_auth(tmp.get(url.as_str()), url);
+                req.send()
                     .await
                     .map_err(|e| CrawlError::Fetch(format!("{url}: {e}")))?
             } else {
-                self.client
-                    .get(url.as_str())
-                    .send()
+                let req = self.apply_bot_auth(self.client.get(url.as_str()), url);
+                req.send()
                     .await
                     .map_err(|e| CrawlError::Fetch(format!("{url}: {e}")))?
             }
         } else {
-            self.client
-                .get(url.as_str())
-                .send()
+            let req = self.apply_bot_auth(self.client.get(url.as_str()), url);
+            req.send()
                 .await
                 .map_err(|e| CrawlError::Fetch(format!("{url}: {e}")))?
         };

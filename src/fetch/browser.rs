@@ -2,8 +2,10 @@ use chrono::Utc;
 use crate::core::error::CrawlError;
 use crate::core::traits::Fetcher;
 use crate::core::types::{FetchMethod, FetchedPage};
+use dig2browser::bot_auth::RequestSigner;
 use dig2browser::{BrowserPool, PoolConfig, StealthConfig};
 use futures::future::BoxFuture;
+use std::sync::Arc;
 use std::time::Instant;
 use url::Url;
 
@@ -16,6 +18,8 @@ use crate::fetch::retry::RetryConfig;
 ///
 /// Optionally retries failed navigations with exponential backoff when a
 /// [`RetryConfig`] is supplied.
+///
+/// Optionally injects Web Bot Auth headers via a [`RequestSigner`].
 pub struct BrowserFetcher {
     pool: BrowserPool,
     /// Optional CSS selector to wait for before capturing HTML.
@@ -26,6 +30,8 @@ pub struct BrowserFetcher {
     wait_selector: Option<String>,
     /// Optional retry configuration.
     retry: Option<RetryConfig>,
+    /// Optional Web Bot Auth signer.
+    signer: Option<Arc<RequestSigner>>,
 }
 
 impl BrowserFetcher {
@@ -33,10 +39,13 @@ impl BrowserFetcher {
     ///
     /// Pass `wait_selector = Some("…")` to wait for a CSS selector on every
     /// page before capturing HTML (useful for SPAs).
+    ///
+    /// Pass `signer = Some(arc)` to inject Web Bot Auth headers before each navigation.
     pub async fn new(
         pool_size: usize,
         stealth: StealthConfig,
         wait_selector: Option<String>,
+        signer: Option<Arc<RequestSigner>>,
     ) -> Result<Self, CrawlError> {
         let config = PoolConfig {
             size: pool_size,
@@ -50,6 +59,7 @@ impl BrowserFetcher {
             pool,
             wait_selector,
             retry: None,
+            signer,
         })
     }
 
@@ -76,6 +86,20 @@ impl BrowserFetcher {
             .acquire()
             .await
             .map_err(|e| CrawlError::Fetch(format!("browser acquire: {e}")))?;
+
+        if let Some(signer) = &self.signer {
+            if let Ok(headers) = signer.sign_request("GET", url.as_str()) {
+                let mut extra_headers = std::collections::HashMap::new();
+                extra_headers.insert("Signature-Agent".to_string(), headers.signature_agent);
+                extra_headers.insert("Signature-Input".to_string(), headers.signature_input);
+                extra_headers.insert("Signature".to_string(), headers.signature);
+                pool_page
+                    .page()
+                    .set_extra_http_headers(extra_headers)
+                    .await
+                    .map_err(|e| CrawlError::Fetch(format!("browser set headers: {e}")))?;
+            }
+        }
 
         pool_page
             .page()
