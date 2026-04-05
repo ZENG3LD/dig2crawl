@@ -21,6 +21,18 @@ struct Cli {
     /// Path to Ed25519 private key for bot auth (default: keys/bot.key)
     #[arg(long, global = true, default_value = "keys/bot.key")]
     bot_key: String,
+
+    /// Launch browser in visible (non-headless) mode
+    #[arg(long, global = true)]
+    headed: bool,
+
+    /// Use a persistent browser profile directory (reuses cookies/sessions)
+    #[arg(long, global = true, value_name = "PATH")]
+    browser_profile: Option<PathBuf>,
+
+    /// BCP-47 locale tag for browser (e.g. "ru-RU", "en-US"). Applies to both auth and browser mode.
+    #[arg(long, global = true, default_value = "ru-RU")]
+    locale: String,
 }
 
 #[derive(Subcommand)]
@@ -129,6 +141,12 @@ enum Command {
         #[arg(long)]
         browser: bool,
     },
+
+    /// Open a visible browser for manual login / captcha solving; saves cookies to --browser-profile
+    Auth {
+        /// URL to open in the browser
+        url: String,
+    },
 }
 
 #[tokio::main]
@@ -156,6 +174,12 @@ async fn main() -> Result<()> {
             None
         };
 
+    let browser_opts = BrowserOpts {
+        headed: cli.headed,
+        profile: cli.browser_profile,
+        locale: cli.locale,
+    };
+
     match cli.command {
         Command::Discover {
             url,
@@ -164,7 +188,7 @@ async fn main() -> Result<()> {
             wait_selector,
             model,
             output_dir,
-        } => cmd_discover(url, goal, browser, wait_selector, model, output_dir, signer).await,
+        } => cmd_discover(url, goal, browser, wait_selector, model, output_dir, signer, browser_opts).await,
 
         Command::Extract {
             url,
@@ -172,7 +196,7 @@ async fn main() -> Result<()> {
             browser,
             max_pages,
             output,
-        } => cmd_extract(url, profile, browser, max_pages, output, signer).await,
+        } => cmd_extract(url, profile, browser, max_pages, output, signer, browser_opts).await,
 
         Command::ExportSpec {
             profile,
@@ -188,35 +212,76 @@ async fn main() -> Result<()> {
             metadata,
             jsonld,
             antibot,
-        } => cmd_fetch(url, browser, wait_selector, output, metadata, jsonld, antibot, signer).await,
+        } => cmd_fetch(url, browser, wait_selector, output, metadata, jsonld, antibot, signer, browser_opts).await,
 
         Command::TestSelector {
             url,
             selector,
             fields,
             browser,
-        } => cmd_test_selector(url, selector, fields, browser, signer).await,
+        } => cmd_test_selector(url, selector, fields, browser, signer, browser_opts).await,
 
         Command::CollectLinks {
             url,
             depth,
             domain_only,
             browser,
-        } => cmd_collect_links(url, depth, domain_only, browser, signer).await,
+        } => cmd_collect_links(url, depth, domain_only, browser, signer, browser_opts).await,
+
+        Command::Auth { url } => {
+            let profile_path = browser_opts.profile.ok_or_else(|| {
+                anyhow::anyhow!("auth command requires --browser-profile")
+            })?;
+            dig2browser::cookies::open_auth_session_with_locale(
+                &url,
+                &profile_path,
+                dig2browser::BrowserPreference::Auto,
+                Some(&browser_opts.locale),
+            )
+            .await
+            .context("auth session failed")?;
+            Ok(())
+        }
     }
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
+/// Browser-specific options collected from global CLI flags.
+struct BrowserOpts {
+    /// When `true`, launches Chrome in visible (non-headless) mode.
+    headed: bool,
+    /// When `Some(path)`, uses a persistent profile directory to reuse cookies/sessions.
+    profile: Option<PathBuf>,
+    /// BCP-47 locale tag (e.g. "ru-RU") applied to both browser fingerprint and auth sessions.
+    locale: String,
+}
+
 async fn make_fetcher(
     browser: bool,
     wait_selector: Option<String>,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
+    opts: BrowserOpts,
 ) -> Result<Box<dyn dig2crawl::core::traits::Fetcher>> {
     if browser {
-        let fetcher = dig2crawl::fetch::browser::BrowserFetcher::new(
-            1,
-            dig2browser::StealthConfig::russian(),
+        let stealth = dig2browser::StealthConfig {
+            locale: dig2browser::stealth::LocaleProfile {
+                locale: opts.locale.clone(),
+                timezone: None,
+            },
+            ..dig2browser::StealthConfig::russian()
+        };
+        let mut config = dig2browser::PoolConfig {
+            size: 1,
+            stealth,
+            ..dig2browser::PoolConfig::default()
+        };
+        config.launch.headless = !opts.headed;
+        if let Some(path) = opts.profile {
+            config.launch.profile = dig2browser::BrowserProfile::Persistent(path);
+        }
+        let fetcher = dig2crawl::fetch::browser::BrowserFetcher::with_config(
+            config,
             wait_selector,
             signer,
         )
@@ -464,6 +529,7 @@ async fn cmd_discover(
     _model: String,
     output_dir: Option<PathBuf>,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
+    browser_opts: BrowserOpts,
 ) -> Result<()> {
     println!("Discovering site structure for: {url_str}");
     println!("Goal: {goal}");
@@ -471,7 +537,7 @@ async fn cmd_discover(
 
     // 1. Fetch the page
     println!("[1/5] Fetching page...");
-    let fetcher = make_fetcher(browser, wait_selector, signer).await?;
+    let fetcher = make_fetcher(browser, wait_selector, signer, browser_opts).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
     println!(
         "      OK — {} bytes, {}ms",
@@ -686,6 +752,7 @@ async fn cmd_extract(
     max_pages: usize,
     output: Option<PathBuf>,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
+    browser_opts: BrowserOpts,
 ) -> Result<()> {
     // Load profile
     let profile_json = std::fs::read_to_string(&profile_path)
@@ -693,7 +760,7 @@ async fn cmd_extract(
     let profile: dig2crawl::core::types::SiteProfile = serde_json::from_str(&profile_json)
         .with_context(|| format!("Failed to parse profile: {}", profile_path.display()))?;
 
-    let fetcher = make_fetcher(browser || profile.requires_browser, None, signer).await?;
+    let fetcher = make_fetcher(browser || profile.requires_browser, None, signer, browser_opts).await?;
     let extractor = dig2crawl::parser::SelectorExtractor::new();
 
     let mut all_records: Vec<serde_json::Value> = Vec::new();
@@ -819,8 +886,9 @@ async fn cmd_fetch(
     show_jsonld: bool,
     show_antibot: bool,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
+    browser_opts: BrowserOpts,
 ) -> Result<()> {
-    let fetcher = make_fetcher(browser, wait_selector, signer).await?;
+    let fetcher = make_fetcher(browser, wait_selector, signer, browser_opts).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
 
     eprintln!(
@@ -888,11 +956,12 @@ async fn cmd_test_selector(
     field_specs: Vec<String>,
     browser: bool,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
+    browser_opts: BrowserOpts,
 ) -> Result<()> {
     use chrono::Utc;
     use dig2crawl::core::types::{ExtractMode, FieldConfig, SiteProfile};
 
-    let fetcher = make_fetcher(browser, None, signer).await?;
+    let fetcher = make_fetcher(browser, None, signer, browser_opts).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
 
     // Parse field specs: "name:css_selector"
@@ -946,10 +1015,11 @@ async fn cmd_collect_links(
     domain_only: bool,
     browser: bool,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
+    browser_opts: BrowserOpts,
 ) -> Result<()> {
     use std::collections::{HashSet, VecDeque};
 
-    let fetcher = make_fetcher(browser, None, signer).await?;
+    let fetcher = make_fetcher(browser, None, signer, browser_opts).await?;
     let parsed_url = url::Url::parse(&url_str)?;
     let seed_domain = parsed_url.host_str().unwrap_or("").to_string();
 

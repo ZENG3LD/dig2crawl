@@ -71,13 +71,38 @@ dig2crawl extract <url> --profile output/<domain>/profile.json --max-pages 5 --o
 dig2crawl export-spec output/<domain>/profile.json --schedule "0 6 * * *" --output spec.json
 dig2crawl export-spec output/<domain>/profile.json --schedule "0 6 * * *" --output spec.toml
 
+# Cookie auth — open a visible browser, log in / pass captcha, save cookies to profile
+dig2crawl auth <url> --browser-profile %TEMP%/mysite-profile
+
 # Debug tools
 dig2crawl fetch <url> [--browser] [--output page.html] [--metadata] [--jsonld] [--antibot]
 dig2crawl test-selector <url> --selector "div.item" --field "title:h2.name" --field "price:.price"
 dig2crawl collect-links <url> [--depth 2] [--domain-only]
 ```
 
-Global flag: `--verbose` / `-v` enables debug logging.
+Global flags:
+
+- `--verbose` / `-v` — debug logging
+- `--headed` — launch browser in visible (non-headless) mode
+- `--browser-profile <PATH>` — persistent profile directory (reuses cookies/sessions across runs)
+
+## Cookie interceptor (`auth`)
+
+For sites behind captcha or login walls (e.g. Yandex SmartCaptcha), use the `auth` subcommand to open a visible Chrome window where you can log in manually. Cookies are saved to the persistent profile directory and reused by subsequent `discover`/`extract`/`fetch` commands.
+
+```bash
+# Step 1: Open browser, pass captcha, close the window
+dig2crawl auth https://yandex.cloud/ru/prices --browser-profile %TEMP%/yandexcloud-profile
+
+# Step 2: Use the saved profile for headless crawling
+dig2crawl discover https://yandex.cloud/ru/prices \
+    --goal "Extract cloud VM pricing" \
+    --browser --browser-profile %TEMP%/yandexcloud-profile
+```
+
+Under the hood, `auth` calls `dig2browser::cookies::open_auth_session()` which launches Chrome with `--user-data-dir` pointing to the profile directory. The same profile is then passed to `BrowserPool` via `BrowserProfile::Persistent(path)`.
+
+This pattern comes from `daemon4russian-parser` (Yandex Maps enrichment daemon) where the same two-step flow is used: visible browser for initial auth, then headless reuse with the persistent profile.
 
 ## Agent internals
 

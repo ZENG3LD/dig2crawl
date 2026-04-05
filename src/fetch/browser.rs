@@ -2,14 +2,13 @@ use chrono::Utc;
 use crate::core::error::CrawlError;
 use crate::core::traits::Fetcher;
 use crate::core::types::{FetchMethod, FetchedPage};
+use crate::fetch::retry::RetryConfig;
 use dig2browser::bot_auth::RequestSigner;
 use dig2browser::{BrowserPool, PoolConfig, StealthConfig};
 use futures::future::BoxFuture;
 use std::sync::Arc;
 use std::time::Instant;
 use url::Url;
-
-use crate::fetch::retry::RetryConfig;
 
 /// Headless-browser fetcher backed by a `dig2browser::BrowserPool`.
 ///
@@ -52,6 +51,18 @@ impl BrowserFetcher {
             stealth,
             ..PoolConfig::default()
         };
+        Self::with_config(config, wait_selector, signer).await
+    }
+
+    /// Launch a browser pool with a fully specified [`PoolConfig`].
+    ///
+    /// Use this when you need control over `launch.headless`, `launch.profile`,
+    /// or other low-level settings that `new()` does not expose.
+    pub async fn with_config(
+        config: PoolConfig,
+        wait_selector: Option<String>,
+        signer: Option<Arc<RequestSigner>>,
+    ) -> Result<Self, CrawlError> {
         let pool = BrowserPool::new(config)
             .await
             .map_err(|e| CrawlError::Fetch(format!("browser pool init: {e}")))?;
