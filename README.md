@@ -44,24 +44,52 @@ Discovery runs in 5 steps:
 
 After discovery, `extract` applies the saved profile in pure Rust — no agent needed.
 
-## Browser mode
+## Browser mode (default)
 
-Pass `--browser` to fetch through dig2browser — a stealth headless Chrome driver.
+dig2crawl uses a stealth headless browser (dig2browser) **by default** for all commands.
 
 - Uses CDP/BiDi with stealth scripts that patch `navigator.webdriver` and related fingerprint vectors
 - Bypasses Cloudflare and other WAF challenges that block plain HTTP clients
 - Waits for a CSS selector to appear before capturing HTML (`--wait-selector`)
-- Required for sites with JS-rendered pricing tables (e.g. ruvds.com, hostkey.com, ishosting.com)
+- Auto-creates a persistent browser profile per domain at `%TEMP%/dig2crawl-profiles/<domain>/`
 
-Without `--browser`, dig2crawl uses a plain `reqwest` HTTP client, which is faster and sufficient for static or server-rendered pages.
+Pass `--http-only` to fall back to a plain `reqwest` HTTP client — faster, sufficient for static or server-rendered pages.
+
+## Fingerprint configuration
+
+Use `--fingerprint <path>` to load a JSON file that configures the browser fingerprint. All fields are optional — omitted fields use defaults (en-US locale, Standard stealth level, 1920x1080 viewport).
+
+```json
+{
+  "level": "full",
+  "locale": "ru-RU",
+  "timezone": "Europe/Moscow",
+  "viewport": [1440, 900],
+  "hardware_concurrency": 4,
+  "device_memory_gb": 4,
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `level` | string | `"standard"` | Stealth level: `"basic"`, `"standard_no_webgl"`, `"standard"`, `"full"` |
+| `locale` | string | `"en-US"` | BCP-47 locale tag |
+| `timezone` | string | `null` | IANA timezone (e.g. `"Europe/Moscow"`) |
+| `viewport` | `[w, h]` | `[1920, 1080]` | Screen resolution |
+| `hardware_concurrency` | int | `8` | `navigator.hardwareConcurrency` |
+| `device_memory_gb` | int | `8` | `navigator.deviceMemory` (GB) |
+| `user_agent` | string | Chrome 131 | Full User-Agent string |
+
+The fingerprint applies to both `auth` (visible browser) and all headless commands. This ensures the auth session and subsequent crawling share the same fingerprint — critical for sites that compare session fingerprints against cookie fingerprints (e.g. Yandex SmartCaptcha).
 
 ## CLI
 
 ```bash
-# Discover selectors and produce a SiteProfile
+# Discover selectors and produce a SiteProfile (browser by default)
 dig2crawl discover <url> --goal "Extract VPS plans: name, price, cpu, ram, disk"
-dig2crawl discover <url> --goal "..." --browser --wait-selector "div.tariffs"
-dig2crawl discover <url> --goal "..." --output-dir ./profiles/mysite
+dig2crawl discover <url> --goal "..." --wait-selector "div.tariffs"
+dig2crawl discover <url> --goal "..." --http-only --output-dir ./profiles/mysite
 
 # Extract data using a saved profile (pure Rust, no agent)
 dig2crawl extract <url> --profile output/<domain>/profile.json
@@ -71,11 +99,14 @@ dig2crawl extract <url> --profile output/<domain>/profile.json --max-pages 5 --o
 dig2crawl export-spec output/<domain>/profile.json --schedule "0 6 * * *" --output spec.json
 dig2crawl export-spec output/<domain>/profile.json --schedule "0 6 * * *" --output spec.toml
 
-# Cookie auth — open a visible browser, log in / pass captcha, save cookies to profile
-dig2crawl auth <url> --browser-profile %TEMP%/mysite-profile
+# Cookie auth — open a visible browser, log in / pass captcha, save cookies
+# Profile auto-created at %TEMP%/dig2crawl-profiles/<domain>/
+dig2crawl auth <url>
+dig2crawl auth <url> --browser-profile %TEMP%/custom-profile  # explicit profile path
+dig2crawl auth <url> --fingerprint russian.json               # custom fingerprint for auth
 
-# Debug tools
-dig2crawl fetch <url> [--browser] [--output page.html] [--metadata] [--jsonld] [--antibot]
+# Debug tools (browser by default, add --http-only for plain HTTP)
+dig2crawl fetch <url> [--output page.html] [--metadata] [--jsonld] [--antibot]
 dig2crawl test-selector <url> --selector "div.item" --field "title:h2.name" --field "price:.price"
 dig2crawl collect-links <url> [--depth 2] [--domain-only]
 ```
@@ -84,7 +115,10 @@ Global flags:
 
 - `--verbose` / `-v` — debug logging
 - `--headed` — launch browser in visible (non-headless) mode
-- `--browser-profile <PATH>` — persistent profile directory (reuses cookies/sessions across runs)
+- `--browser-profile <PATH>` — explicit persistent profile directory (default: auto `%TEMP%/dig2crawl-profiles/<domain>/`)
+- `--fingerprint <PATH>` — JSON fingerprint config (locale, timezone, viewport, stealth level, etc.)
+- `--bot-auth <JWKS_URL>` — enable Web Bot Auth signing
+- `--bot-key <PATH>` — Ed25519 private key for bot auth (default: `keys/bot.key`)
 
 ## Cookie interceptor (`auth`)
 
@@ -92,17 +126,20 @@ For sites behind captcha or login walls (e.g. Yandex SmartCaptcha), use the `aut
 
 ```bash
 # Step 1: Open browser, pass captcha, close the window
-dig2crawl auth https://yandex.cloud/ru/prices --browser-profile %TEMP%/yandexcloud-profile
+# Profile auto-created at %TEMP%/dig2crawl-profiles/yandex.cloud/
+dig2crawl auth https://yandex.cloud/ru/prices --fingerprint russian.json
 
-# Step 2: Use the saved profile for headless crawling
+# Step 2: Use the saved profile for headless crawling (same fingerprint!)
 dig2crawl discover https://yandex.cloud/ru/prices \
     --goal "Extract cloud VM pricing" \
-    --browser --browser-profile %TEMP%/yandexcloud-profile
+    --fingerprint russian.json
 ```
 
-Under the hood, `auth` calls `dig2browser::cookies::open_auth_session()` which launches Chrome with `--user-data-dir` pointing to the profile directory. The same profile is then passed to `BrowserPool` via `BrowserProfile::Persistent(path)`.
+The `--fingerprint` flag ensures auth and headless sessions share the same browser fingerprint. Without it, default fingerprint (en-US) is used for both.
 
-This pattern comes from `daemon4russian-parser` (Yandex Maps enrichment daemon) where the same two-step flow is used: visible browser for initial auth, then headless reuse with the persistent profile.
+Under the hood, `auth` calls `dig2browser::cookies::open_auth_session_with_locale()` which launches Chrome with the same stealth args as headless mode (`LaunchConfig::build_args()`). The profile directory is passed via `--user-data-dir`.
+
+This pattern comes from `daemon4russian-parser` (Yandex Maps enrichment daemon) where the same two-step flow is used: visible browser for initial auth, then `StealthBrowser` headless reuse with the persistent profile.
 
 ## Agent internals
 

@@ -30,9 +30,9 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     browser_profile: Option<PathBuf>,
 
-    /// BCP-47 locale tag for browser (e.g. "ru-RU", "en-US"). Applies to both auth and browser mode.
-    #[arg(long, global = true, default_value = "ru-RU")]
-    locale: String,
+    /// Path to fingerprint JSON config (locale, timezone, viewport, stealth level, etc.)
+    #[arg(long, global = true, value_name = "PATH")]
+    fingerprint: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -44,9 +44,9 @@ enum Command {
         /// Natural-language goal describing what data to extract
         #[arg(short, long)]
         goal: String,
-        /// Use headless browser instead of plain HTTP
+        /// Use plain HTTP instead of browser
         #[arg(long)]
-        browser: bool,
+        http_only: bool,
         /// CSS selector to wait for (browser mode only)
         #[arg(long)]
         wait_selector: Option<String>,
@@ -65,9 +65,9 @@ enum Command {
         /// Path to profile.json produced by `discover`
         #[arg(short, long)]
         profile: PathBuf,
-        /// Use headless browser
+        /// Use plain HTTP instead of browser
         #[arg(long)]
-        browser: bool,
+        http_only: bool,
         /// Follow pagination up to this many pages (default: 1)
         #[arg(long, default_value = "1")]
         max_pages: usize,
@@ -92,9 +92,9 @@ enum Command {
     Fetch {
         /// URL to fetch
         url: String,
-        /// Use headless browser
+        /// Use plain HTTP instead of browser
         #[arg(long)]
-        browser: bool,
+        http_only: bool,
         /// CSS selector to wait for (browser mode only)
         #[arg(long)]
         wait_selector: Option<String>,
@@ -122,9 +122,9 @@ enum Command {
         /// Additional field selectors in "name:css" format
         #[arg(short, long = "field")]
         fields: Vec<String>,
-        /// Use headless browser
+        /// Use plain HTTP instead of browser
         #[arg(long)]
-        browser: bool,
+        http_only: bool,
     },
 
     /// Collect all links from a page (optionally follow to depth N)
@@ -137,9 +137,9 @@ enum Command {
         /// Only return links on the same domain as the seed URL
         #[arg(long)]
         domain_only: bool,
-        /// Use headless browser
+        /// Use plain HTTP instead of browser
         #[arg(long)]
-        browser: bool,
+        http_only: bool,
     },
 
     /// Open a visible browser for manual login / captcha solving; saves cookies to --browser-profile
@@ -177,26 +177,26 @@ async fn main() -> Result<()> {
     let browser_opts = BrowserOpts {
         headed: cli.headed,
         profile: cli.browser_profile,
-        locale: cli.locale,
+        fingerprint: cli.fingerprint,
     };
 
     match cli.command {
         Command::Discover {
             url,
             goal,
-            browser,
+            http_only,
             wait_selector,
             model,
             output_dir,
-        } => cmd_discover(url, goal, browser, wait_selector, model, output_dir, signer, browser_opts).await,
+        } => cmd_discover(url, goal, !http_only, wait_selector, model, output_dir, signer, browser_opts).await,
 
         Command::Extract {
             url,
             profile,
-            browser,
+            http_only,
             max_pages,
             output,
-        } => cmd_extract(url, profile, browser, max_pages, output, signer, browser_opts).await,
+        } => cmd_extract(url, profile, !http_only, max_pages, output, signer, browser_opts).await,
 
         Command::ExportSpec {
             profile,
@@ -206,37 +206,41 @@ async fn main() -> Result<()> {
 
         Command::Fetch {
             url,
-            browser,
+            http_only,
             wait_selector,
             output,
             metadata,
             jsonld,
             antibot,
-        } => cmd_fetch(url, browser, wait_selector, output, metadata, jsonld, antibot, signer, browser_opts).await,
+        } => cmd_fetch(url, !http_only, wait_selector, output, metadata, jsonld, antibot, signer, browser_opts).await,
 
         Command::TestSelector {
             url,
             selector,
             fields,
-            browser,
-        } => cmd_test_selector(url, selector, fields, browser, signer, browser_opts).await,
+            http_only,
+        } => cmd_test_selector(url, selector, fields, !http_only, signer, browser_opts).await,
 
         Command::CollectLinks {
             url,
             depth,
             domain_only,
-            browser,
-        } => cmd_collect_links(url, depth, domain_only, browser, signer, browser_opts).await,
+            http_only,
+        } => cmd_collect_links(url, depth, domain_only, !http_only, signer, browser_opts).await,
 
         Command::Auth { url } => {
+            let mut browser_opts = browser_opts;
+            browser_opts.resolve_profile(&url);
             let profile_path = browser_opts.profile.ok_or_else(|| {
-                anyhow::anyhow!("auth command requires --browser-profile")
+                anyhow::anyhow!("auth command requires --browser-profile or a valid URL for auto-profile")
             })?;
+            let stealth = load_fingerprint(&browser_opts.fingerprint)?;
+            let locale = stealth.locale.locale.clone();
             dig2browser::cookies::open_auth_session_with_locale(
                 &url,
                 &profile_path,
                 dig2browser::BrowserPreference::Auto,
-                Some(&browser_opts.locale),
+                Some(&locale),
             )
             .await
             .context("auth session failed")?;
@@ -253,8 +257,93 @@ struct BrowserOpts {
     headed: bool,
     /// When `Some(path)`, uses a persistent profile directory to reuse cookies/sessions.
     profile: Option<PathBuf>,
-    /// BCP-47 locale tag (e.g. "ru-RU") applied to both browser fingerprint and auth sessions.
-    locale: String,
+    /// Path to fingerprint JSON config.
+    fingerprint: Option<PathBuf>,
+}
+
+impl BrowserOpts {
+    /// Resolve the profile directory. If no explicit `--browser-profile` was given,
+    /// auto-creates `<TEMP>/dig2crawl-profiles/<domain>/`.
+    fn resolve_profile(&mut self, url_str: &str) {
+        if self.profile.is_none() {
+            if let Ok(parsed) = url::Url::parse(url_str) {
+                if let Some(domain) = parsed.host_str() {
+                    let dir = std::env::temp_dir()
+                        .join("dig2crawl-profiles")
+                        .join(domain);
+                    let _ = std::fs::create_dir_all(&dir);
+                    self.profile = Some(dir);
+                }
+            }
+        }
+    }
+}
+
+/// JSON-serialisable fingerprint configuration.
+/// All fields are optional — omitted fields use `StealthConfig::default()` values.
+#[derive(serde::Deserialize, Default)]
+struct FingerprintConfig {
+    /// Stealth level: "basic", "standard_no_webgl", "standard", "full"
+    level: Option<String>,
+    /// BCP-47 locale (e.g. "ru-RU", "en-US")
+    locale: Option<String>,
+    /// IANA timezone (e.g. "Europe/Moscow")
+    timezone: Option<String>,
+    /// Viewport [width, height]
+    viewport: Option<[u32; 2]>,
+    /// navigator.hardwareConcurrency
+    hardware_concurrency: Option<u32>,
+    /// navigator.deviceMemory (GB)
+    device_memory_gb: Option<u32>,
+    /// Custom User-Agent string
+    user_agent: Option<String>,
+}
+
+impl FingerprintConfig {
+    fn into_stealth_config(self) -> dig2browser::StealthConfig {
+        let mut cfg = dig2browser::StealthConfig::default();
+        if let Some(level) = self.level {
+            cfg.level = match level.as_str() {
+                "basic" => dig2browser::stealth::StealthLevel::Basic,
+                "standard_no_webgl" => dig2browser::stealth::StealthLevel::StandardNoWebGL,
+                "standard" => dig2browser::stealth::StealthLevel::Standard,
+                "full" => dig2browser::stealth::StealthLevel::Full,
+                _ => cfg.level,
+            };
+        }
+        if let Some(locale) = self.locale {
+            cfg.locale.locale = locale;
+        }
+        if let Some(tz) = self.timezone {
+            cfg.locale.timezone = Some(tz);
+        }
+        if let Some([w, h]) = self.viewport {
+            cfg.viewport = (w, h);
+        }
+        if let Some(hc) = self.hardware_concurrency {
+            cfg.hardware_concurrency = hc;
+        }
+        if let Some(dm) = self.device_memory_gb {
+            cfg.device_memory_gb = dm;
+        }
+        if let Some(ua) = self.user_agent {
+            cfg.user_agent = ua;
+        }
+        cfg
+    }
+}
+
+fn load_fingerprint(path: &Option<PathBuf>) -> Result<dig2browser::StealthConfig> {
+    match path {
+        Some(p) => {
+            let json = std::fs::read_to_string(p)
+                .with_context(|| format!("Failed to read fingerprint config: {}", p.display()))?;
+            let cfg: FingerprintConfig = serde_json::from_str(&json)
+                .with_context(|| format!("Failed to parse fingerprint config: {}", p.display()))?;
+            Ok(cfg.into_stealth_config())
+        }
+        None => Ok(dig2browser::StealthConfig::default()),
+    }
 }
 
 async fn make_fetcher(
@@ -264,13 +353,7 @@ async fn make_fetcher(
     opts: BrowserOpts,
 ) -> Result<Box<dyn dig2crawl::core::traits::Fetcher>> {
     if browser {
-        let stealth = dig2browser::StealthConfig {
-            locale: dig2browser::stealth::LocaleProfile {
-                locale: opts.locale.clone(),
-                timezone: None,
-            },
-            ..dig2browser::StealthConfig::russian()
-        };
+        let stealth = load_fingerprint(&opts.fingerprint)?;
         let mut launch = dig2browser::LaunchConfig {
             headless: !opts.headed,
             browser_pref: dig2browser::BrowserPreference::Auto,
@@ -529,7 +612,7 @@ async fn cmd_discover(
     _model: String,
     output_dir: Option<PathBuf>,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
-    browser_opts: BrowserOpts,
+    mut browser_opts: BrowserOpts,
 ) -> Result<()> {
     println!("Discovering site structure for: {url_str}");
     println!("Goal: {goal}");
@@ -537,6 +620,7 @@ async fn cmd_discover(
 
     // 1. Fetch the page
     println!("[1/5] Fetching page...");
+    browser_opts.resolve_profile(&url_str);
     let fetcher = make_fetcher(browser, wait_selector, signer, browser_opts).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
     println!(
@@ -752,7 +836,7 @@ async fn cmd_extract(
     max_pages: usize,
     output: Option<PathBuf>,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
-    browser_opts: BrowserOpts,
+    mut browser_opts: BrowserOpts,
 ) -> Result<()> {
     // Load profile
     let profile_json = std::fs::read_to_string(&profile_path)
@@ -760,6 +844,7 @@ async fn cmd_extract(
     let profile: dig2crawl::core::types::SiteProfile = serde_json::from_str(&profile_json)
         .with_context(|| format!("Failed to parse profile: {}", profile_path.display()))?;
 
+    browser_opts.resolve_profile(&url_str);
     let fetcher = make_fetcher(browser || profile.requires_browser, None, signer, browser_opts).await?;
     let extractor = dig2crawl::parser::SelectorExtractor::new();
 
@@ -886,8 +971,9 @@ async fn cmd_fetch(
     show_jsonld: bool,
     show_antibot: bool,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
-    browser_opts: BrowserOpts,
+    mut browser_opts: BrowserOpts,
 ) -> Result<()> {
+    browser_opts.resolve_profile(&url_str);
     let fetcher = make_fetcher(browser, wait_selector, signer, browser_opts).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
 
@@ -956,11 +1042,12 @@ async fn cmd_test_selector(
     field_specs: Vec<String>,
     browser: bool,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
-    browser_opts: BrowserOpts,
+    mut browser_opts: BrowserOpts,
 ) -> Result<()> {
     use chrono::Utc;
     use dig2crawl::core::types::{ExtractMode, FieldConfig, SiteProfile};
 
+    browser_opts.resolve_profile(&url_str);
     let fetcher = make_fetcher(browser, None, signer, browser_opts).await?;
     let page = fetch_page(fetcher.as_ref(), &url_str).await?;
 
@@ -1015,10 +1102,11 @@ async fn cmd_collect_links(
     domain_only: bool,
     browser: bool,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
-    browser_opts: BrowserOpts,
+    mut browser_opts: BrowserOpts,
 ) -> Result<()> {
     use std::collections::{HashSet, VecDeque};
 
+    browser_opts.resolve_profile(&url_str);
     let fetcher = make_fetcher(browser, None, signer, browser_opts).await?;
     let parsed_url = url::Url::parse(&url_str)?;
     let seed_domain = parsed_url.host_str().unwrap_or("").to_string();
