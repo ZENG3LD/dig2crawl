@@ -1,6 +1,6 @@
 [package]
 name = "dig2crawl"
-version = "0.3.17"
+version = "0.3.18"
 edition = "2021"
 license = "MIT"
 description = "Universal agnostic web crawler with Claude-powered CSS selector discovery"
@@ -43,5 +43,6 @@ clap           = { version = "4", features = ["derive"] }
 tempfile       = "3"
 rand           = "0.8"
 dig2browser    = "0.4"
+gate4agent     = "0.1"
 
 [workspace]

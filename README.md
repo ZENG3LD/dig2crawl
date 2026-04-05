@@ -185,31 +185,25 @@ See [dig2browser README](https://github.com/ZENG3LD/dig2browser#cli-tools) for f
 
 ## Agent internals
 
-`AgentSession` drives the Claude CLI (`@anthropic-ai/claude-code`) via subprocess.
+`AgentSession` wraps [gate4agent](https://crates.io/crates/gate4agent) `PipeSession` — the same library used by `agent2overlay`.
 
-**Bootstrap pattern** — avoids the Windows cmd.exe 8191-character argument limit:
+**Pipe mode** — Claude CLI runs in headless NDJSON-streaming mode:
 
-- The full prompt is written to `%TEMP%/dig2crawl_<pid>/prompt.md`
-- The expected response path is `%TEMP%/dig2crawl_<pid>/response.json`
-- The `-p` argument sent to Claude stays under 300 bytes: `"Read and execute the instructions in <prompt.md> — write your JSON response to <response.json>"`
-- Claude uses its `Read` tool to load the prompt and HTML, then its `Write` tool to save the response
-- On subsequent turns `--resume <session_id>` is passed so full context is retained across discovery → validation
-- `--dangerously-skip-permissions` enables file tool use in one-shot mode
+- Prompts are delivered via **stdin** (no file intermediary, no cmd.exe argument length limits)
+- Claude responds via **stdout** as NDJSON `stream-json` events (`PipeText`, `PipeToolStart`, `PipeSessionEnd`, etc.)
+- `--resume <session_id>` is captured from `PipeSessionStart` events and passed on subsequent calls — L1 → validation → L2 → L3 all share the **same conversational context**
+- `--dangerously-skip-permissions` enables tool use (Read, Grep, Bash) in one-shot mode
+- Claude reads HTML/screenshot files referenced in the prompt via its Read tool (with `offset`/`limit` for large files)
+
+**HTML cleaning** — before saving to disk, `<script>`, `<style>`, `<svg>`, `<noscript>` tags are stripped and whitespace collapsed (typically 70-90% size reduction). Claude reads the cleaned file in chunks if needed.
 
 **Temp directory layout during a `discover` run:**
 
 ```
 %TEMP%/dig2crawl_<pid>/
-├── page.html                  — raw fetched HTML (unmodified)
-├── prompt.md                  — discovery instructions for Claude
-├── response.json              — Claude's discovery JSON response
-├── validation_prompt.md       — validation instructions for Claude
-├── validation_response.json   — Claude's validation JSON response
-├── l2_prompt.md               — L2 interactive prompt (if escalated)
-├── l2_response.json           — L2 browser actions response
-├── l3_screenshot.png          — L3 page screenshot (if escalated)
-├── l3_prompt.md               — L3 visual prompt
-└── l3_response.json           — L3 visual actions response
+├── page.html              — cleaned fetched HTML (scripts/styles stripped)
+├── l2_page.html           — post-action HTML (if L2 escalated)
+└── l3_screenshot.png      — page screenshot (if L3 escalated)
 ```
 
 The directory is deleted when the session closes.
@@ -279,6 +273,7 @@ cargo build --release --bin dig2crawl
 | Crate | Purpose |
 |-------|---------|
 | dig2browser | Stealth browser automation (CDP + BiDi) — crates.io |
+| gate4agent | Claude CLI pipe session with NDJSON streaming — crates.io |
 | scraper | CSS selector engine |
 | reqwest | HTTP client |
 | rusqlite | SQLite storage |

@@ -89,6 +89,7 @@ pub enum AgentStatus {
     PartialSuccess,
     NoData,
     Failed,
+    Failure,
     Blocked,
     Error,
 }

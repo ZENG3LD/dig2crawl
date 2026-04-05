@@ -633,6 +633,39 @@ fn should_escalate(records: usize, confidence: f64, min_records: usize, min_conf
     records < min_records || confidence < min_confidence
 }
 
+/// Strip noise from HTML to stay within Claude Code's Read tool token limit (~10 000 tokens).
+///
+/// Removes `<script>`, `<style>`, `<svg>`, `<noscript>`, HTML comments,
+/// and collapses consecutive whitespace. Preserves the DOM structure that
+/// Claude needs for CSS selector discovery.
+fn strip_html_noise(html: &str) -> String {
+    // Remove blocks: <script>...</script>, <style>...</style>, <svg>...</svg>, <noscript>...</noscript>
+    // Rust regex doesn't support backreferences, so we strip each tag separately.
+    let mut cleaned = std::borrow::Cow::Borrowed(html);
+    for tag in &["script", "style", "svg", "noscript"] {
+        let re = regex::Regex::new(&format!(r"(?is)<{tag}\b[^>]*>.*?</{tag}\s*>")).unwrap();
+        cleaned = std::borrow::Cow::Owned(re.replace_all(&cleaned, "").into_owned());
+    }
+
+    // Remove HTML comments
+    let re_comments = regex::Regex::new(r"(?s)<!--.*?-->").unwrap();
+    let cleaned = re_comments.replace_all(&cleaned, "");
+
+    // Remove data-* attributes with long values (base64 images, JSON blobs)
+    let re_data = regex::Regex::new(r#"\s+data-[\w-]+="[^"]{100,}""#).unwrap();
+    let mut cleaned = re_data.replace_all(&cleaned, "");
+
+    // Remove empty class/id attributes
+    let re_empty_attr = regex::Regex::new(r#"\s+(class|id)="""#).unwrap();
+    cleaned = std::borrow::Cow::Owned(re_empty_attr.replace_all(&cleaned, "").into_owned());
+
+    // Collapse whitespace (newlines, tabs, multiple spaces → single space)
+    let re_ws = regex::Regex::new(r"\s{2,}").unwrap();
+    let cleaned = re_ws.replace_all(&cleaned, " ");
+
+    cleaned.into_owned()
+}
+
 async fn cmd_discover(
     url_str: String,
     goal: String,
@@ -694,16 +727,36 @@ async fn cmd_discover(
         .context("Failed to start Claude agent session. Is `claude` CLI installed?")?;
 
     // Create a per-run job directory in the system temp dir
-    let job_dir = std::env::temp_dir().join(format!("dig2crawl_{}", std::process::id()));
+    // Use USERPROFILE-based temp path to avoid Windows 8.3 short names (VAPC~1)
+    // that Claude Code's Read tool may not resolve correctly.
+    let temp_base = std::env::var("USERPROFILE")
+        .map(|p| {
+            std::path::PathBuf::from(p)
+                .join("AppData")
+                .join("Local")
+                .join("Temp")
+        })
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let job_dir = temp_base.join(format!("dig2crawl_{}", std::process::id()));
     tokio::fs::create_dir_all(&job_dir)
         .await
         .with_context(|| format!("Failed to create job dir: {}", job_dir.display()))?;
 
-    // Save full HTML to file — Claude will read it with its Read tool
+    // Save cleaned HTML to file — Claude reads it via its Read tool (using offset/limit for large files).
+    // Strip <script>, <style>, <svg>, <noscript> tags and collapse whitespace to reduce noise.
     let html_path = job_dir.join("page.html");
-    tokio::fs::write(&html_path, &page.body)
+    let cleaned_html = strip_html_noise(&page.body);
+    tokio::fs::write(&html_path, &cleaned_html)
         .await
         .with_context(|| format!("Failed to write HTML to {}", html_path.display()))?;
+    if cleaned_html.len() < page.body.len() {
+        println!(
+            "      HTML cleaned: {} → {} bytes ({:.0}% reduction)",
+            page.body.len(),
+            cleaned_html.len(),
+            (1.0 - cleaned_html.len() as f64 / page.body.len() as f64) * 100.0,
+        );
+    }
 
     // Enrich goal with JSON-LD context if available
     let jsonld_context = if !jsonld_items.is_empty() {
@@ -715,16 +768,10 @@ async fn cmd_discover(
     };
     let full_goal = format!("{goal}{jsonld_context}");
 
-    // Build the discovery prompt that references the HTML file
-    let response_path = job_dir.join("response.json");
+    // Build the discovery prompt — Claude reads HTML via its Read tool,
+    // returns JSON as text (no file write needed)
     let discovery_prompt =
-        dig2crawl::agent::prompts::build_discovery_prompt(&html_path, &response_path, &full_goal);
-
-    // Write prompt to file — Claude reads it via bootstrap
-    let prompt_path = job_dir.join("prompt.md");
-    tokio::fs::write(&prompt_path, &discovery_prompt)
-        .await
-        .with_context(|| format!("Failed to write prompt to {}", prompt_path.display()))?;
+        dig2crawl::agent::prompts::build_discovery_prompt(&html_path, &full_goal);
 
     println!(
         "      Sending discovery prompt ({} chars, HTML: {} bytes)...",
@@ -732,15 +779,10 @@ async fn cmd_discover(
         page.body.len(),
     );
 
-    session
-        .send_with_files(&prompt_path, &response_path)
+    let discovery_raw = session
+        .send_prompt(&discovery_prompt)
         .await
         .context("Discovery prompt failed")?;
-
-    // Read response.json written by Claude
-    let discovery_raw = tokio::fs::read_to_string(&response_path)
-        .await
-        .with_context(|| format!("Claude did not write response to {}", response_path.display()))?;
 
     tracing::debug!(response_len = discovery_raw.len(), "Discovery response received");
 
@@ -771,52 +813,38 @@ async fn cmd_discover(
 
     println!("      Extracted {} record(s) with discovered selectors", extracted_records.len());
 
-    // Send validation prompt to Claude (same session, bootstrap pattern)
+    // Send validation prompt to Claude (same session — --resume preserves context)
     if !extracted_records.is_empty() {
         let snapshot = discovery_response.updated_memory.clone().unwrap_or_default();
         let validation_prompt =
             dig2crawl::agent::prompts::build_validation_prompt(&extracted_records, &snapshot);
 
-        // Write validation prompt + output path to files
-        let validation_response_path = job_dir.join("validation_response.json");
-        let validation_prompt_with_output = format!(
-            "{validation_prompt}\n\n---\n\nWrite your JSON response to: {}",
-            validation_response_path.display(),
-        );
-        let validation_prompt_path = job_dir.join("validation_prompt.md");
-        tokio::fs::write(&validation_prompt_path, &validation_prompt_with_output)
-            .await
-            .with_context(|| format!("Failed to write validation prompt to {}", validation_prompt_path.display()))?;
-
         println!("      Sending validation prompt...");
-        if session
-            .send_with_files(&validation_prompt_path, &validation_response_path)
-            .await
-            .is_ok()
-        {
-            let validation_raw = tokio::fs::read_to_string(&validation_response_path)
-                .await
-                .unwrap_or_default();
-
-            if let Ok(validation_response) = parse_agent_response(&validation_raw) {
-                if let Some(vr) = &validation_response.validation_result {
-                    println!(
-                        "      Validation: {} — {} items extracted, confidence {:.2}",
-                        if vr.passed { "PASSED" } else { "FAILED" },
-                        vr.items_extracted,
-                        vr.confidence,
-                    );
-                    if !vr.issues.is_empty() {
-                        println!("      Issues:");
-                        for issue in &vr.issues {
-                            println!("        - {issue}");
+        match session.send_prompt(&validation_prompt).await {
+            Ok(validation_raw) => {
+                if let Ok(validation_response) = parse_agent_response(&validation_raw) {
+                    if let Some(vr) = &validation_response.validation_result {
+                        println!(
+                            "      Validation: {} — {} items extracted, confidence {:.2}",
+                            if vr.passed { "PASSED" } else { "FAILED" },
+                            vr.items_extracted,
+                            vr.confidence,
+                        );
+                        if !vr.issues.is_empty() {
+                            println!("      Issues:");
+                            for issue in &vr.issues {
+                                println!("        - {issue}");
+                            }
+                        }
+                        profile.validated = vr.passed;
+                        if vr.confidence > 0.0 {
+                            profile.confidence = vr.confidence as f64;
                         }
                     }
-                    profile.validated = vr.passed;
-                    if vr.confidence > 0.0 {
-                        profile.confidence = vr.confidence as f64;
-                    }
                 }
+            }
+            Err(e) => {
+                eprintln!("      Validation prompt failed: {e}");
             }
         }
     } else {
@@ -835,47 +863,104 @@ async fn cmd_discover(
         println!("[L2] Escalating to interactive extraction (clicks/scrolls)...");
         current_level = 2;
 
-        // Ask Claude for browser actions
+        // Ask Claude for browser actions — response comes back as text via PipeText events
         let l1_failure_reason = format!(
             "only {} record(s) extracted (need {}, confidence {:.2} below {:.2})",
             extracted_records.len(), min_records, profile.confidence, min_confidence,
         );
         let interactive_prompt = dig2crawl::agent::prompts::build_interactive_prompt(
             &html_path,
-            &job_dir.join("l2_response.json"),
             &goal,
             &l1_failure_reason,
         );
-        let l2_prompt_path = job_dir.join("l2_prompt.md");
-        let l2_response_path = job_dir.join("l2_response.json");
-        tokio::fs::write(&l2_prompt_path, &interactive_prompt).await?;
 
-        if session.send_with_files(&l2_prompt_path, &l2_response_path).await.is_ok() {
-            let l2_raw = tokio::fs::read_to_string(&l2_response_path).await.unwrap_or_default();
-            if let Ok(l2_resp) = parse_agent_response(&l2_raw) {
-                if !l2_resp.browser_actions.is_empty() {
-                    println!("      Claude suggested {} browser action(s)", l2_resp.browser_actions.len());
+        match session.send_prompt(&interactive_prompt).await {
+            Ok(l2_raw) => {
+                if l2_raw.is_empty() {
+                    eprintln!("      L2 response is empty — Claude produced no output");
+                } else {
+                    match parse_agent_response(&l2_raw) {
+                        Ok(l2_resp) => {
+                            if !l2_resp.browser_actions.is_empty() {
+                                println!("      Claude suggested {} browser action(s)", l2_resp.browser_actions.len());
+                                for (i, action) in l2_resp.browser_actions.iter().enumerate() {
+                                    println!("        [{}/{}] {:?}", i + 1, l2_resp.browser_actions.len(), action);
+                                }
 
-                    // We need a BrowserFetcher to open pages — extract from handle
-                    if let FetcherHandle::Browser(ref browser_fetcher) = handle {
-                        let parsed = url::Url::parse(&url_str)?;
-                        match browser_fetcher.fetch_with_actions(&parsed, &l2_resp.browser_actions).await {
-                            Ok(actioned_page) => {
-                                println!("      Actions executed — re-extracting...");
-                                let l2_records = extractor.extract(&actioned_page.body, &profile);
-                                println!("      L2 extracted {} record(s) (was {})", l2_records.len(), extracted_records.len());
-                                if l2_records.len() > extracted_records.len() {
-                                    extracted_records = l2_records;
+                                if let FetcherHandle::Browser(ref browser_fetcher) = handle {
+                                    let parsed = url::Url::parse(&url_str)?;
+                                    match browser_fetcher.fetch_with_actions(&parsed, &l2_resp.browser_actions).await {
+                                        Ok(actioned_page) => {
+                                            println!("      Actions executed — re-extracting...");
+
+                                            // Save post-action HTML for potential re-discovery prompt
+                                            let l2_html_path = job_dir.join("l2_page.html");
+                                            let l2_cleaned = strip_html_noise(&actioned_page.body);
+                                            if let Err(e) = tokio::fs::write(&l2_html_path, &l2_cleaned).await {
+                                                eprintln!("      Warning: failed to save L2 HTML: {e}");
+                                            }
+
+                                            let l2_records = extractor.extract(&actioned_page.body, &profile);
+                                            println!("      L2 extracted {} record(s) (was {})", l2_records.len(), extracted_records.len());
+                                            if l2_records.len() > extracted_records.len() {
+                                                extracted_records = l2_records;
+                                            } else {
+                                                // Actions ran but selector didn't improve — ask Claude
+                                                // to re-discover selectors from the updated DOM
+                                                let actions_json = serde_json::to_string_pretty(&l2_resp.browser_actions)
+                                                    .unwrap_or_else(|_| "[]".to_string());
+                                                let post_action_prompt =
+                                                    dig2crawl::agent::prompts::build_post_action_prompt(
+                                                        &l2_html_path,
+                                                        &goal,
+                                                        &actions_json,
+                                                    );
+                                                println!("      Sending post-action re-extraction prompt...");
+                                                match session.send_prompt(&post_action_prompt).await {
+                                                    Ok(reextract_raw) => {
+                                                        if let Ok(reextract_resp) = parse_agent_response(&reextract_raw) {
+                                                            // Rebuild profile from new field_configs
+                                                            if !reextract_resp.field_configs.is_empty() {
+                                                                if let Ok(new_profile) = build_site_profile(&domain, &reextract_resp, browser) {
+                                                                    let new_records = extractor.extract(&actioned_page.body, &new_profile);
+                                                                    println!("      Post-action re-discovery: {} record(s)", new_records.len());
+                                                                    if new_records.len() > extracted_records.len() {
+                                                                        extracted_records = new_records;
+                                                                        profile = new_profile;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("      Post-action re-extraction failed: {e}");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("      L2 action execution failed: {e}");
+                                        }
+                                    }
+                                }
+                            } else {
+                                println!("      Claude suggested no browser actions — skipping L2");
+                            }
+                            if !l2_resp.logs.is_empty() {
+                                for log in &l2_resp.logs {
+                                    println!("      [claude] {log}");
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("      L2 action execution failed: {e}");
-                            }
+                        }
+                        Err(e) => {
+                            eprintln!("      L2 JSON parse error: {e}");
+                            eprintln!("      Raw (first 500 chars): {}", &l2_raw[..l2_raw.len().min(500)]);
                         }
                     }
-                } else {
-                    println!("      Claude suggested no browser actions — skipping L2");
                 }
+            }
+            Err(e) => {
+                eprintln!("      L2 Claude session failed: {e}");
             }
         }
     }
@@ -899,39 +984,41 @@ async fn cmd_discover(
                         tokio::fs::write(&screenshot_path, &screenshot).await?;
                         println!("      Screenshot captured ({} bytes)", screenshot.len());
 
+                        // Build visual prompt — Claude reads screenshot via Read tool,
+                        // returns JSON as text (no file write)
                         let visual_prompt = dig2crawl::agent::prompts::build_visual_prompt(
                             &screenshot_path,
-                            &job_dir.join("l3_response.json"),
                             &goal,
                             &page.body,
                         );
-                        let l3_prompt_path = job_dir.join("l3_prompt.md");
-                        let l3_response_path = job_dir.join("l3_response.json");
-                        tokio::fs::write(&l3_prompt_path, &visual_prompt).await?;
 
-                        if session.send_with_files(&l3_prompt_path, &l3_response_path).await.is_ok() {
-                            let l3_raw = tokio::fs::read_to_string(&l3_response_path).await.unwrap_or_default();
-                            if let Ok(l3_resp) = parse_agent_response(&l3_raw) {
-                                if !l3_resp.visual_actions.is_empty() {
-                                    println!("      Claude Vision suggested {} action(s)", l3_resp.visual_actions.len());
-                                    // Convert visual actions to browser actions and execute
-                                    let browser_actions: Vec<dig2crawl::agent::actions::BrowserAction> =
-                                        l3_resp.visual_actions.iter().filter_map(|va| va.to_browser_action()).collect();
-                                    let outcome = dig2crawl::fetch::interactive::execute_actions(&live_page, &browser_actions).await;
-                                    match outcome {
-                                        Ok(result) => {
-                                            println!("      Visual actions executed — re-extracting...");
-                                            let l3_records = extractor.extract(&result.html, &profile);
-                                            println!("      L3 extracted {} record(s) (was {})", l3_records.len(), extracted_records.len());
-                                            if l3_records.len() > extracted_records.len() {
-                                                extracted_records = l3_records;
+                        match session.send_prompt(&visual_prompt).await {
+                            Ok(l3_raw) => {
+                                if let Ok(l3_resp) = parse_agent_response(&l3_raw) {
+                                    if !l3_resp.visual_actions.is_empty() {
+                                        println!("      Claude Vision suggested {} action(s)", l3_resp.visual_actions.len());
+                                        // Convert visual actions to browser actions and execute
+                                        let browser_actions: Vec<dig2crawl::agent::actions::BrowserAction> =
+                                            l3_resp.visual_actions.iter().filter_map(|va| va.to_browser_action()).collect();
+                                        let outcome = dig2crawl::fetch::interactive::execute_actions(&live_page, &browser_actions).await;
+                                        match outcome {
+                                            Ok(result) => {
+                                                println!("      Visual actions executed — re-extracting...");
+                                                let l3_records = extractor.extract(&result.html, &profile);
+                                                println!("      L3 extracted {} record(s) (was {})", l3_records.len(), extracted_records.len());
+                                                if l3_records.len() > extracted_records.len() {
+                                                    extracted_records = l3_records;
+                                                }
                                             }
+                                            Err(e) => eprintln!("      L3 visual action execution failed: {e}"),
                                         }
-                                        Err(e) => eprintln!("      L3 visual action execution failed: {e}"),
+                                    } else {
+                                        println!("      Claude Vision suggested no actions");
                                     }
-                                } else {
-                                    println!("      Claude Vision suggested no actions");
                                 }
+                            }
+                            Err(e) => {
+                                eprintln!("      L3 Claude session failed: {e}");
                             }
                         }
                     }

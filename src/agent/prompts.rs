@@ -72,13 +72,11 @@ Your response MUST be a single valid JSON object:
 
 /// Build a Phase 1 (discovery) prompt for `AgentSession`.
 ///
-/// The prompt is written to a file (not inlined). Claude reads the HTML file
-/// at `html_path` using its Read tool, analyses the DOM, and writes its JSON
-/// response to `output_path`.
+/// Claude reads the HTML file at `html_path` using its Read tool, analyses the
+/// DOM, and returns the JSON response directly as its text output (no file write).
 ///
-/// This file-based approach avoids Windows cmd.exe argument-length limits and
-/// lets Claude use its native Read/Write tools rather than receiving huge stdin blobs.
-pub fn build_discovery_prompt(html_path: &Path, output_path: &Path, goal: &str) -> String {
+/// The caller collects Claude's text response and parses JSON from it.
+pub fn build_discovery_prompt(html_path: &Path, goal: &str) -> String {
     format!(
         r#"You are a CSS selector discovery agent. Your task is to analyse HTML and find precise selectors for structured data extraction.
 
@@ -88,15 +86,15 @@ pub fn build_discovery_prompt(html_path: &Path, output_path: &Path, goal: &str) 
 ## Instructions
 
 1. Use the Read tool to read the HTML file at: {html_path}
+   **IMPORTANT**: The file may be large. If you get a "File content exceeds maximum allowed tokens" error, use `offset` and `limit` parameters to read the file in chunks (e.g. offset=1, limit=2000, then offset=2001, limit=2000, etc.). Read until you find the section with repeating data items. Use Grep on the file to quickly locate relevant sections (e.g. search for "price", "plan", "tariff", or class names related to the goal).
 2. Analyse the DOM structure — look for repeating elements, JSON-LD, data attributes, class patterns.
 3. Find the CSS selector for the **repeating container** element that wraps each individual item (e.g. a product card, a job listing, an article summary).
 4. For each requested field, find the CSS selector **relative to the container** and determine the best extraction mode.
 5. Identify the pagination pattern if one exists.
-6. Use the Write tool to write your JSON response to: {output_path}
 
 ## Response format
 
-Write ONLY a single valid JSON object to {output_path} — no prose, no markdown, no explanation:
+Return ONLY a single valid JSON object as your response text — no prose, no markdown code blocks, no explanation:
 
 ```json
 {{
@@ -166,9 +164,8 @@ Write ONLY a single valid JSON object to {output_path} — no prose, no markdown
 - Field selectors must be relative to the container element.
 - Only include fields that are present in the HTML. Use confidence 0.0 for fields you could not find.
 - Do not hallucinate selectors. If unsure, set a lower confidence value.
-- Write exactly one JSON object to {output_path}. Nothing else."#,
+- Output exactly one JSON object. Do NOT wrap it in markdown fences."#,
         html_path = html_path.display(),
-        output_path = output_path.display(),
         goal = goal,
     )
 }
@@ -179,7 +176,7 @@ Write ONLY a single valid JSON object to {output_path} — no prose, no markdown
 ///
 /// Asks Claude to verify whether the `SiteMemorySnapshot` selectors discovered in
 /// Phase 1 actually match the provided sample data. Returns a `validation_result`
-/// block inside the standard `AgentResponse` JSON.
+/// block inside the standard `AgentResponse` JSON as direct text output.
 ///
 /// `extracted_data` is a slice of JSON values produced by the fast-path selector
 /// extractor. The prompt shows Claude this data so it can cross-check field
@@ -213,7 +210,7 @@ Review the extracted data against the site profile and answer:
 
 ## Response format
 
-Return ONLY a single valid JSON object — no prose, no markdown:
+Return ONLY a single valid JSON object as your response text — no prose, no markdown code blocks:
 
 ```json
 {{
@@ -247,7 +244,7 @@ Return ONLY a single valid JSON object — no prose, no markdown:
 - `field_status` must have an entry for every field present in the site profile.
 - `issues` lists actionable problems — empty array if everything is fine.
 - `confidence` reflects how likely this config is to work on unseen pages of the same site.
-- Return exactly one JSON object. Nothing else."#
+- Output exactly one JSON object. Do NOT wrap it in markdown fences."#
     )
 }
 
@@ -257,9 +254,9 @@ Return ONLY a single valid JSON object — no prose, no markdown:
 ///
 /// Tells Claude that L1 CSS extraction found insufficient data and asks it to
 /// return `browser_actions` — a list of interactions to expose hidden content.
+/// Claude reads the HTML file via its Read tool and returns JSON as direct text.
 pub fn build_interactive_prompt(
     html_path: &std::path::Path,
-    output_path: &std::path::Path,
     goal: &str,
     l1_failure_reason: &str,
 ) -> String {
@@ -298,21 +295,26 @@ Each action is a JSON object with a `type` field:
 - Set `needs_visual_pass: true` if you suspect the page uses dynamic class names or canvas rendering
 
 ## Response Format
-Write your JSON response to: {output_path}
 
-Use the standard AgentResponse format with these additions:
+Return ONLY a single valid JSON object as your response text — no prose, no markdown code blocks:
+
 ```json
 {{
+  "version": "2.0.0",
+  "task_id": "interactive",
   "status": "success",
+  "records": [],
+  "next_urls": [],
   "browser_actions": [...],
   "needs_visual_pass": false,
   "field_configs": [...],
-  "confidence": 0.7
+  "confidence": 0.7,
+  "logs": []
 }}
 ```
-"#,
+
+Do NOT wrap in markdown fences. Output exactly one JSON object."#,
         html_path = html_path.display(),
-        output_path = output_path.display(),
         goal = goal,
         l1_failure_reason = l1_failure_reason,
     )
@@ -322,10 +324,10 @@ Use the standard AgentResponse format with these additions:
 
 /// Build a Level 2 re-extraction prompt after browser actions were executed.
 ///
-/// Claude receives the updated HTML (post-actions) and re-runs CSS selector discovery.
+/// Claude receives the updated HTML (post-actions) via Read tool and re-runs
+/// CSS selector discovery. Returns JSON as direct text output.
 pub fn build_post_action_prompt(
     post_action_html_path: &std::path::Path,
-    output_path: &std::path::Path,
     goal: &str,
     executed_actions_json: &str,
 ) -> String {
@@ -348,22 +350,26 @@ The page HTML has been re-captured after these actions.
 {goal}
 
 ## Response Format
-Write your JSON response to: {output_path}
 
-Use the standard AgentResponse format:
+Return ONLY a single valid JSON object as your response text — no prose, no markdown code blocks:
+
 ```json
 {{
+  "version": "2.0.0",
+  "task_id": "post_action",
   "status": "success",
+  "records": [],
+  "next_urls": [],
   "field_configs": [...],
   "confidence": 0.8,
-  "browser_actions": []
+  "browser_actions": [],
+  "logs": []
 }}
 ```
 
 Do NOT return more browser_actions unless absolutely necessary. This is a re-extraction pass — focus on finding selectors in the updated DOM.
-"#,
+Do NOT wrap in markdown fences. Output exactly one JSON object."#,
         post_action_html_path = post_action_html_path.display(),
-        output_path = output_path.display(),
         goal = goal,
         executed_actions_json = executed_actions_json,
     )
@@ -374,9 +380,9 @@ Do NOT return more browser_actions unless absolutely necessary. This is a re-ext
 /// Build a Level 3 (visual) prompt for Claude Vision.
 ///
 /// Claude reads a screenshot PNG and identifies interactive elements by appearance.
+/// Returns JSON as direct text output (no file write).
 pub fn build_visual_prompt(
     screenshot_path: &std::path::Path,
-    output_path: &std::path::Path,
     goal: &str,
     html_hint: &str,
 ) -> String {
@@ -411,19 +417,25 @@ Each action is a JSON object with an `action` field:
 Coordinates are viewport-relative pixels (top-left is 0,0).
 
 ## Response Format
-Write your JSON response to: {output_path}
+
+Return ONLY a single valid JSON object as your response text — no prose, no markdown code blocks:
 
 ```json
 {{
+  "version": "2.0.0",
+  "task_id": "visual",
   "status": "success",
+  "records": [],
+  "next_urls": [],
   "visual_actions": [...],
   "field_configs": [...],
-  "confidence": 0.5
+  "confidence": 0.5,
+  "logs": []
 }}
 ```
-"#,
+
+Do NOT wrap in markdown fences. Output exactly one JSON object."#,
         screenshot_path = screenshot_path.display(),
-        output_path = output_path.display(),
         goal = goal,
         html_context = html_context,
     )
