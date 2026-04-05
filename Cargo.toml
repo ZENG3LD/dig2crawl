@@ -1,6 +1,6 @@
 [package]
 name = "dig2crawl"
-version = "0.3.9"
+version = "0.3.10"
 edition = "2021"
 license = "MIT"
 description = "Universal agnostic web crawler with Claude-powered CSS selector discovery"

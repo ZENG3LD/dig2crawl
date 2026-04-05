@@ -48,10 +48,20 @@ After discovery, `extract` applies the saved profile in pure Rust — no agent n
 
 dig2crawl uses a stealth headless browser (dig2browser) **by default** for all commands.
 
-- Uses CDP/BiDi with stealth scripts that patch `navigator.webdriver` and related fingerprint vectors
+Supported browsers:
+
+| Browser | Backend | Detection | Notes |
+|---------|---------|-----------|-------|
+| Chrome | CDP | Auto (first priority) | Full stealth: UA override, Client Hints, canvas noise, WebGL spoof |
+| Edge | CDP | Auto (second priority) | Same Chromium flags as Chrome |
+| Firefox | BiDi | `"browser": "firefox"` in fingerprint | Stealth via `moz:firefoxOptions.prefs`, requires geckodriver |
+
+- Uses CDP (Chrome/Edge) or BiDi (Firefox) with stealth scripts that patch `navigator.webdriver` and related fingerprint vectors
 - Bypasses Cloudflare and other WAF challenges that block plain HTTP clients
 - Waits for a CSS selector to appear before capturing HTML (`--wait-selector`)
 - Auto-creates a persistent browser profile per domain at `%TEMP%/dig2crawl-profiles/<domain>/`
+
+By default, dig2browser auto-detects Chrome → Edge. To force a specific browser, set `"browser"` in the fingerprint config.
 
 Pass `--http-only` to fall back to a plain `reqwest` HTTP client — faster, sufficient for static or server-rendered pages.
 
@@ -61,6 +71,7 @@ Use `--fingerprint <path>` to load a JSON file that configures the browser finge
 
 ```json
 {
+  "browser": "chrome",
   "level": "full",
   "locale": "ru-RU",
   "timezone": "Europe/Moscow",
@@ -73,6 +84,7 @@ Use `--fingerprint <path>` to load a JSON file that configures the browser finge
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `browser` | string | `"auto"` | Browser: `"auto"`, `"chrome"`, `"edge"`, `"firefox"` |
 | `level` | string | `"standard"` | Stealth level: `"basic"`, `"standard_no_webgl"`, `"standard"`, `"full"` |
 | `locale` | string | `"en-US"` | BCP-47 locale tag |
 | `timezone` | string | `null` | IANA timezone (e.g. `"Europe/Moscow"`) |
@@ -80,6 +92,8 @@ Use `--fingerprint <path>` to load a JSON file that configures the browser finge
 | `hardware_concurrency` | int | `8` | `navigator.hardwareConcurrency` |
 | `device_memory_gb` | int | `8` | `navigator.deviceMemory` (GB) |
 | `user_agent` | string | Chrome 131 | Full User-Agent string |
+
+**Firefox note:** Firefox uses the BiDi protocol via geckodriver (must be running at `http://localhost:4444`). Stealth is applied via `moz:firefoxOptions.prefs` — no CDP-level overrides. `set_extra_http_headers` is not supported on Firefox.
 
 The fingerprint applies to both `auth` (visible browser) and all headless commands. This ensures the auth session and subsequent crawling share the same fingerprint — critical for sites that compare session fingerprints against cookie fingerprints (e.g. Yandex SmartCaptcha).
 

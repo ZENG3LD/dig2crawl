@@ -234,7 +234,7 @@ async fn main() -> Result<()> {
             let profile_path = browser_opts.profile.ok_or_else(|| {
                 anyhow::anyhow!("auth command requires --browser-profile or a valid URL for auto-profile")
             })?;
-            let stealth = load_fingerprint(&browser_opts.fingerprint)?;
+            let (stealth, _browser_pref) = load_fingerprint(&browser_opts.fingerprint)?;
             let locale = stealth.locale.locale.clone();
             dig2browser::cookies::open_auth_session_with_locale(
                 &url,
@@ -297,10 +297,12 @@ struct FingerprintConfig {
     device_memory_gb: Option<u32>,
     /// Custom User-Agent string
     user_agent: Option<String>,
+    /// Browser preference: "auto", "chrome", "edge", "firefox"
+    browser: Option<String>,
 }
 
 impl FingerprintConfig {
-    fn into_stealth_config(self) -> dig2browser::StealthConfig {
+    fn into_configs(self) -> (dig2browser::StealthConfig, dig2browser::BrowserPreference) {
         let mut cfg = dig2browser::StealthConfig::default();
         if let Some(level) = self.level {
             cfg.level = match level.as_str() {
@@ -329,20 +331,26 @@ impl FingerprintConfig {
         if let Some(ua) = self.user_agent {
             cfg.user_agent = ua;
         }
-        cfg
+        let browser_pref = match self.browser.as_deref() {
+            Some("chrome") => dig2browser::BrowserPreference::ChromeOnly,
+            Some("edge") => dig2browser::BrowserPreference::EdgeOnly,
+            Some("firefox") => dig2browser::BrowserPreference::Firefox,
+            _ => dig2browser::BrowserPreference::Auto,
+        };
+        (cfg, browser_pref)
     }
 }
 
-fn load_fingerprint(path: &Option<PathBuf>) -> Result<dig2browser::StealthConfig> {
+fn load_fingerprint(path: &Option<PathBuf>) -> Result<(dig2browser::StealthConfig, dig2browser::BrowserPreference)> {
     match path {
         Some(p) => {
             let json = std::fs::read_to_string(p)
                 .with_context(|| format!("Failed to read fingerprint config: {}", p.display()))?;
             let cfg: FingerprintConfig = serde_json::from_str(&json)
                 .with_context(|| format!("Failed to parse fingerprint config: {}", p.display()))?;
-            Ok(cfg.into_stealth_config())
+            Ok(cfg.into_configs())
         }
-        None => Ok(dig2browser::StealthConfig::default()),
+        None => Ok((dig2browser::StealthConfig::default(), dig2browser::BrowserPreference::Auto)),
     }
 }
 
@@ -353,10 +361,10 @@ async fn make_fetcher(
     opts: BrowserOpts,
 ) -> Result<Box<dyn dig2crawl::core::traits::Fetcher>> {
     if browser {
-        let stealth = load_fingerprint(&opts.fingerprint)?;
+        let (stealth, browser_pref) = load_fingerprint(&opts.fingerprint)?;
         let mut launch = dig2browser::LaunchConfig {
             headless: !opts.headed,
-            browser_pref: dig2browser::BrowserPreference::Auto,
+            browser_pref,
             ..dig2browser::LaunchConfig::default()
         };
         if let Some(path) = opts.profile {
