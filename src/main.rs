@@ -249,6 +249,11 @@ impl BrowserOpts {
                         .join("dig2crawl-profiles")
                         .join(domain);
                     let _ = std::fs::create_dir_all(&dir);
+                    // Remove stale lockfile from previous sessions
+                    let lockfile = dir.join("lockfile");
+                    if lockfile.exists() {
+                        let _ = std::fs::remove_file(&lockfile);
+                    }
                     self.profile = Some(dir);
                 }
             }
@@ -331,12 +336,34 @@ fn load_fingerprint(path: &Option<PathBuf>) -> Result<(dig2browser::StealthConfi
     }
 }
 
+/// Owns either a browser or HTTP fetcher and shuts the browser down on exit.
+enum FetcherHandle {
+    Browser(dig2crawl::fetch::browser::BrowserFetcher),
+    Http(dig2crawl::fetch::http::HttpFetcher),
+}
+
+impl FetcherHandle {
+    fn as_fetcher(&self) -> &dyn dig2crawl::core::traits::Fetcher {
+        match self {
+            Self::Browser(f) => f,
+            Self::Http(f) => f,
+        }
+    }
+
+    /// Shuts down the browser process if one was started.
+    async fn shutdown(self) {
+        if let Self::Browser(f) = self {
+            let _ = f.shutdown().await;
+        }
+    }
+}
+
 async fn make_fetcher(
     browser: bool,
     wait_selector: Option<String>,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
     opts: BrowserOpts,
-) -> Result<Box<dyn dig2crawl::core::traits::Fetcher>> {
+) -> Result<FetcherHandle> {
     if browser {
         let (stealth, browser_pref) = load_fingerprint(&opts.fingerprint)?;
         let mut launch = dig2browser::LaunchConfig {
@@ -355,14 +382,14 @@ async fn make_fetcher(
         )
         .await
         .context("Failed to start browser")?;
-        Ok(Box::new(fetcher))
+        Ok(FetcherHandle::Browser(fetcher))
     } else {
         let fetcher = dig2crawl::fetch::http::HttpFetcher::new(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 dig2crawl/0.1",
             signer,
         )
         .context("Failed to create HTTP client")?;
-        Ok(Box::new(fetcher))
+        Ok(FetcherHandle::Http(fetcher))
     }
 }
 
@@ -606,8 +633,8 @@ async fn cmd_discover(
     // 1. Fetch the page
     println!("[1/5] Fetching page...");
     browser_opts.resolve_profile(&url_str);
-    let fetcher = make_fetcher(browser, wait_selector, signer, browser_opts).await?;
-    let page = fetch_page(fetcher.as_ref(), &url_str).await?;
+    let handle = make_fetcher(browser, wait_selector, signer, browser_opts).await?;
+    let page = fetch_page(handle.as_fetcher(), &url_str).await?;
     println!(
         "      OK — {} bytes, {}ms",
         page.body.len(),
@@ -777,6 +804,7 @@ async fn cmd_discover(
     }
 
     session.close().await;
+    handle.shutdown().await;
 
     // Clean up temp job dir
     let _ = tokio::fs::remove_dir_all(&job_dir).await;
@@ -830,7 +858,7 @@ async fn cmd_extract(
         .with_context(|| format!("Failed to parse profile: {}", profile_path.display()))?;
 
     browser_opts.resolve_profile(&url_str);
-    let fetcher = make_fetcher(browser || profile.requires_browser, None, signer, browser_opts).await?;
+    let handle = make_fetcher(browser || profile.requires_browser, None, signer, browser_opts).await?;
     let extractor = dig2crawl::parser::SelectorExtractor::new();
 
     let mut all_records: Vec<serde_json::Value> = Vec::new();
@@ -839,7 +867,7 @@ async fn cmd_extract(
 
     while pages_done < max_pages {
         println!("Fetching page {}/{}: {current_url}", pages_done + 1, max_pages);
-        let page = fetch_page(fetcher.as_ref(), &current_url).await?;
+        let page = fetch_page(handle.as_fetcher(), &current_url).await?;
         let records = extractor.extract(&page.body, &profile);
         println!("  Extracted {} record(s)", records.len());
         all_records.extend(records);
@@ -884,6 +912,8 @@ async fn cmd_extract(
     }
 
     println!("\nTotal records: {}", all_records.len());
+
+    handle.shutdown().await;
 
     // Output
     match output {
@@ -959,8 +989,8 @@ async fn cmd_fetch(
     mut browser_opts: BrowserOpts,
 ) -> Result<()> {
     browser_opts.resolve_profile(&url_str);
-    let fetcher = make_fetcher(browser, wait_selector, signer, browser_opts).await?;
-    let page = fetch_page(fetcher.as_ref(), &url_str).await?;
+    let handle = make_fetcher(browser, wait_selector, signer, browser_opts).await?;
+    let page = fetch_page(handle.as_fetcher(), &url_str).await?;
 
     eprintln!(
         "Fetched: {} ({} bytes, {}ms, status {:?})",
@@ -1018,6 +1048,7 @@ async fn cmd_fetch(
         None => print!("{}", page.body),
     }
 
+    handle.shutdown().await;
     Ok(())
 }
 
@@ -1033,8 +1064,8 @@ async fn cmd_test_selector(
     use dig2crawl::core::types::{ExtractMode, FieldConfig, SiteProfile};
 
     browser_opts.resolve_profile(&url_str);
-    let fetcher = make_fetcher(browser, None, signer, browser_opts).await?;
-    let page = fetch_page(fetcher.as_ref(), &url_str).await?;
+    let handle = make_fetcher(browser, None, signer, browser_opts).await?;
+    let page = fetch_page(handle.as_fetcher(), &url_str).await?;
 
     // Parse field specs: "name:css_selector"
     let fields: Vec<FieldConfig> = field_specs
@@ -1052,6 +1083,27 @@ async fn cmd_test_selector(
             })
         })
         .collect();
+
+    if fields.is_empty() {
+        // No field selectors — just count and display container matches
+        let document = scraper::Html::parse_document(&page.body);
+        let sel = scraper::Selector::parse(&selector)
+            .map_err(|e| anyhow::anyhow!("Invalid selector '{selector}': {e:?}"))?;
+        let matches: Vec<_> = document.select(&sel).collect();
+        println!("Selector: {selector}");
+        println!("Matches: {}", matches.len());
+        for (i, el) in matches.iter().enumerate() {
+            let text: String = el.text().collect::<String>();
+            let trimmed = text.trim();
+            if trimmed.len() > 200 {
+                println!("[{i}] {}...", &trimmed[..200]);
+            } else {
+                println!("[{i}] {trimmed}");
+            }
+        }
+        handle.shutdown().await;
+        return Ok(());
+    }
 
     let parsed_url = url::Url::parse(&url_str)?;
     let domain = parsed_url.host_str().unwrap_or("unknown").to_string();
@@ -1078,6 +1130,7 @@ async fn cmd_test_selector(
         println!("[{i}] {}", serde_json::to_string(rec).unwrap_or_default());
     }
 
+    handle.shutdown().await;
     Ok(())
 }
 
@@ -1092,7 +1145,7 @@ async fn cmd_collect_links(
     use std::collections::{HashSet, VecDeque};
 
     browser_opts.resolve_profile(&url_str);
-    let fetcher = make_fetcher(browser, None, signer, browser_opts).await?;
+    let handle = make_fetcher(browser, None, signer, browser_opts).await?;
     let parsed_url = url::Url::parse(&url_str)?;
     let seed_domain = parsed_url.host_str().unwrap_or("").to_string();
 
@@ -1104,7 +1157,7 @@ async fn cmd_collect_links(
     visited.insert(url_str.clone());
 
     while let Some((current_url, current_depth)) = queue.pop_front() {
-        let page = match fetch_page(fetcher.as_ref(), &current_url).await {
+        let page = match fetch_page(handle.as_fetcher(), &current_url).await {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Failed to fetch {current_url}: {e}");
@@ -1143,5 +1196,6 @@ async fn cmd_collect_links(
         println!("{link}");
     }
 
+    handle.shutdown().await;
     Ok(())
 }
