@@ -142,11 +142,6 @@ enum Command {
         http_only: bool,
     },
 
-    /// Open a visible browser for manual login / captcha solving; saves cookies to --browser-profile
-    Auth {
-        /// URL to open in the browser
-        url: String,
-    },
 }
 
 #[tokio::main]
@@ -228,24 +223,6 @@ async fn main() -> Result<()> {
             http_only,
         } => cmd_collect_links(url, depth, domain_only, !http_only, signer, browser_opts).await,
 
-        Command::Auth { url } => {
-            let mut browser_opts = browser_opts;
-            browser_opts.resolve_profile(&url);
-            let profile_path = browser_opts.profile.ok_or_else(|| {
-                anyhow::anyhow!("auth command requires --browser-profile or a valid URL for auto-profile")
-            })?;
-            let (stealth, _browser_pref) = load_fingerprint(&browser_opts.fingerprint)?;
-            let locale = stealth.locale.locale.clone();
-            dig2browser::cookies::open_auth_session_with_locale(
-                &url,
-                &profile_path,
-                dig2browser::BrowserPreference::Auto,
-                Some(&locale),
-            )
-            .await
-            .context("auth session failed")?;
-            Ok(())
-        }
     }
 }
 

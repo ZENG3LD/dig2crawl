@@ -1,6 +1,6 @@
 [package]
 name = "dig2crawl"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2021"
 license = "MIT"
 description = "Universal agnostic web crawler with Claude-powered CSS selector discovery"
@@ -9,6 +9,10 @@ repository = "https://github.com/ZENG3LD/dig2crawl"
 [[bin]]
 name = "dig2crawl"
 path = "src/main.rs"
+
+[[bin]]
+name = "cookie-auth"
+path = "src/bin/cookie_auth.rs"
 
 [lib]
 name = "dig2crawl"
