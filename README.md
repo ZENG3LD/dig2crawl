@@ -113,11 +113,10 @@ dig2crawl extract <url> --profile output/<domain>/profile.json --max-pages 5 --o
 dig2crawl export-spec output/<domain>/profile.json --schedule "0 6 * * *" --output spec.json
 dig2crawl export-spec output/<domain>/profile.json --schedule "0 6 * * *" --output spec.toml
 
-# Cookie auth — open a visible browser, log in / pass captcha, save cookies
-# Profile auto-created at %TEMP%/dig2crawl-profiles/<domain>/
-dig2crawl auth <url>
-dig2crawl auth <url> --browser-profile %TEMP%/custom-profile  # explicit profile path
-dig2crawl auth <url> --fingerprint russian.json               # custom fingerprint for auth
+# Cookie auth — separate binary, see below
+cookie-auth <url>
+cookie-auth <url> --profile %TEMP%/custom-profile     # explicit profile path
+cookie-auth <url> --fingerprint russian.json           # custom fingerprint for auth
 
 # Debug tools (browser by default, add --http-only for plain HTTP)
 dig2crawl fetch <url> [--output page.html] [--metadata] [--jsonld] [--antibot]
@@ -134,14 +133,17 @@ Global flags:
 - `--bot-auth <JWKS_URL>` — enable Web Bot Auth signing
 - `--bot-key <PATH>` — Ed25519 private key for bot auth (default: `keys/bot.key`)
 
-## Cookie interceptor (`auth`)
+## Cookie auth (`cookie-auth` binary)
 
-For sites behind captcha or login walls (e.g. Yandex SmartCaptcha), use the `auth` subcommand to open a visible Chrome window where you can log in manually. Cookies are saved to the persistent profile directory and reused by subsequent `discover`/`extract`/`fetch` commands.
+Separate binary for sites behind captcha or login walls (e.g. Yandex SmartCaptcha). Opens a visible browser where you log in manually, saves cookies to a persistent profile reused by subsequent `discover`/`extract`/`fetch` commands.
 
 ```bash
+# Build
+cargo build --release --bin cookie-auth
+
 # Step 1: Open browser, pass captcha, close the window
 # Profile auto-created at %TEMP%/dig2crawl-profiles/yandex.cloud/
-dig2crawl auth https://yandex.cloud/ru/prices --fingerprint russian.json
+cookie-auth https://yandex.cloud/ru/prices --fingerprint russian.json
 
 # Step 2: Use the saved profile for headless crawling (same fingerprint!)
 dig2crawl discover https://yandex.cloud/ru/prices \
@@ -149,11 +151,25 @@ dig2crawl discover https://yandex.cloud/ru/prices \
     --fingerprint russian.json
 ```
 
+| Flag | Description |
+|------|-------------|
+| `--fingerprint <PATH>` | JSON fingerprint config (browser, locale) |
+| `--profile <PATH>` | Explicit profile directory (default: `%TEMP%/dig2crawl-profiles/<domain>/`) |
+
 The `--fingerprint` flag ensures auth and headless sessions share the same browser fingerprint. Without it, default fingerprint (en-US) is used for both.
 
-Under the hood, `auth` calls `dig2browser::cookies::open_auth_session_with_locale()` which launches Chrome with the same stealth args as headless mode (`LaunchConfig::build_args()`). The profile directory is passed via `--user-data-dir`.
+Under the hood, `cookie-auth` calls `dig2browser::cookies::open_auth_session_with_locale()` which launches the browser with the same stealth args as headless mode. The profile directory is passed via `--user-data-dir`.
 
-This pattern comes from `daemon4russian-parser` (Yandex Maps enrichment daemon) where the same two-step flow is used: visible browser for initial auth, then `StealthBrowser` headless reuse with the persistent profile.
+### Browser testing (`dev-fetch` in dig2browser)
+
+For quick browser testing without the full crawler, use `dev-fetch` from dig2browser — DevTools in your terminal:
+
+```bash
+cargo install dig2browser
+dev-fetch https://cloud.vk.com/pricing --fingerprint russian.json --network-log --cookies --save-html out.html
+```
+
+See [dig2browser README](https://github.com/ZENG3LD/dig2browser#cli-tools) for full flag reference.
 
 ## Agent internals
 
