@@ -117,6 +117,67 @@ impl BrowserFetcher {
             screenshot: Some(screenshot),
         })
     }
+
+    /// Navigate to `url` and return the live StealthPage handle without capturing HTML.
+    /// Caller owns the page and is responsible for closing it.
+    pub async fn open_page(
+        &self,
+        url: &Url,
+    ) -> Result<dig2browser::StealthPage, CrawlError> {
+        let page = self.browser
+            .new_blank_page()
+            .await
+            .map_err(|e| CrawlError::Fetch(format!("browser new page: {e}")))?;
+
+        if let Some(signer) = &self.signer {
+            if let Ok(headers) = signer.sign_request("GET", url.as_str()) {
+                let mut extra_headers = std::collections::HashMap::new();
+                extra_headers.insert("Signature-Agent".to_string(), headers.signature_agent);
+                extra_headers.insert("Signature-Input".to_string(), headers.signature_input);
+                extra_headers.insert("Signature".to_string(), headers.signature);
+                page.set_extra_http_headers(extra_headers)
+                    .await
+                    .map_err(|e| CrawlError::Fetch(format!("browser set headers: {e}")))?;
+            }
+        }
+
+        page.goto(url.as_str())
+            .await
+            .map_err(|e| CrawlError::Fetch(format!("browser goto: {e}")))?;
+
+        if let Some(selector) = &self.wait_selector {
+            page.wait()
+                .for_element(selector.as_str())
+                .await
+                .map_err(|e| CrawlError::Fetch(format!("browser wait for element: {e}")))?;
+        }
+
+        Ok(page)
+    }
+
+    /// Fetch a page, execute browser actions, then capture the result.
+    pub async fn fetch_with_actions(
+        &self,
+        url: &Url,
+        actions: &[crate::agent::actions::BrowserAction],
+    ) -> Result<FetchedPage, CrawlError> {
+        let start = Instant::now();
+        let page = self.open_page(url).await?;
+
+        let outcome = crate::fetch::interactive::execute_actions(&page, actions).await?;
+
+        Ok(FetchedPage {
+            url: url.clone(),
+            status_code: Some(200),
+            body: outcome.html,
+            fetched_at: Utc::now(),
+            fetch_ms: start.elapsed().as_millis() as u64,
+            method: FetchMethod::Browser {
+                wait_selector: self.wait_selector.clone(),
+            },
+            screenshot: outcome.screenshot,
+        })
+    }
 }
 
 impl Fetcher for BrowserFetcher {

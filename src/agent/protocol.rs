@@ -3,6 +3,10 @@ use std::collections::HashMap;
 
 pub const PROTOCOL_VERSION: &str = "2.0.0";
 
+fn default_level() -> u8 {
+    1
+}
+
 /// Serialised to JSON, written to a temp file, path passed to claude CLI.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentRequest {
@@ -14,6 +18,10 @@ pub struct AgentRequest {
     pub goal: AgentGoalSpec,
     pub site_memory: SiteMemorySnapshot,
     pub context: HashMap<String, String>,
+
+    /// Which extraction level this request is for (1, 2, or 3).
+    #[serde(default = "default_level")]
+    pub extraction_level: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +64,21 @@ pub struct AgentResponse {
     /// to validate previously discovered selectors against real extracted data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation_result: Option<ValidationResult>,
+
+    // ── v3 additions ──────────────────────────────────────────────────────────
+
+    /// Browser actions Claude wants the crawler to execute (L2 interactive mode).
+    /// Empty in L1 CSS-only responses.
+    #[serde(default)]
+    pub browser_actions: Vec<crate::agent::actions::BrowserAction>,
+
+    /// Whether Claude believes a visual (L3) pass is needed.
+    #[serde(default)]
+    pub needs_visual_pass: bool,
+
+    /// Visual actions from L3 mode.
+    #[serde(default)]
+    pub visual_actions: Vec<crate::agent::actions::VisualAction>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

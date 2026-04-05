@@ -1,5 +1,32 @@
 use thiserror::Error;
 
+/// Why L2 interactive actions failed.
+#[derive(Debug, Error)]
+pub enum InteractiveError {
+    #[error("all {count} selectors in action plan not found in DOM")]
+    SelectorsNotFound { count: usize },
+    #[error("action sequence produced empty HTML")]
+    EmptyResult,
+    #[error("browser error during action: {0}")]
+    Browser(String),
+}
+
+/// Outcome returned from each extraction level to the coordinator.
+#[derive(Debug)]
+pub enum EscalationResult {
+    /// Level produced usable records — stop here.
+    Success {
+        records: Vec<serde_json::Value>,
+        level: u8,
+    },
+    /// Level produced nothing — escalate to next level.
+    Escalate { reason: String },
+    /// Captcha detected — L4 stub.
+    CaptchaBlocked { provider: String },
+    /// Max level reached, no records found.
+    Failed,
+}
+
 #[derive(Debug, Error)]
 pub enum CrawlError {
     #[error("fetch error: {0}")]
@@ -48,6 +75,8 @@ pub enum AgentError {
     ParseResponse(String),
     #[error("process failed: {0}")]
     ProcessFailed(String),
+    #[error("interactive extraction failed: {0}")]
+    Interactive(#[from] InteractiveError),
 }
 
 impl AgentError {

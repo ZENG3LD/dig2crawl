@@ -92,6 +92,7 @@ impl CrawlAgent for AgentBridge {
                     ctx.insert("depth".to_string(), depth.to_string());
                     ctx
                 },
+                extraction_level: 1,
             };
 
             info!(task_id = %task_id, url = %page.url, "Invoking agent");

@@ -250,3 +250,181 @@ Return ONLY a single valid JSON object — no prose, no markdown:
 - Return exactly one JSON object. Nothing else."#
     )
 }
+
+// ── Level 2: Interactive prompt ───────────────────────────────────────────────
+
+/// Build a Level 2 (interactive) prompt for Claude.
+///
+/// Tells Claude that L1 CSS extraction found insufficient data and asks it to
+/// return `browser_actions` — a list of interactions to expose hidden content.
+pub fn build_interactive_prompt(
+    html_path: &std::path::Path,
+    output_path: &std::path::Path,
+    goal: &str,
+    l1_failure_reason: &str,
+) -> String {
+    format!(r#"# Level 2: Interactive Extraction
+
+## Context
+You previously analyzed a page for CSS selectors (Level 1), but the extraction was insufficient: {l1_failure_reason}.
+
+The page may require user interactions to reveal data — e.g. clicking "Load More" buttons, dismissing cookie consent banners, expanding collapsed sections, or filling search forms.
+
+## Your Task
+1. Read the HTML file at: {html_path}
+2. Identify what browser interactions would expose more data relevant to the goal
+3. Return a JSON response with `browser_actions` array AND any CSS `field_configs` you can already determine
+
+## Goal
+{goal}
+
+## Browser Actions You Can Return
+Each action is a JSON object with a `type` field:
+- `{{"type": "click", "selector": "CSS selector"}}` — click an element
+- `{{"type": "type", "selector": "CSS selector", "text": "text to type"}}` — type into an input
+- `{{"type": "scroll_bottom"}}` — scroll to page bottom (for infinite scroll)
+- `{{"type": "scroll_to", "selector": "CSS selector"}}` — scroll element into view
+- `{{"type": "wait_for_element", "selector": "CSS selector", "timeout_ms": 5000}}` — wait for element
+- `{{"type": "wait_ms", "ms": 2000}}` — wait fixed time (max 10s)
+- `{{"type": "dismiss_overlay", "selector": "CSS selector"}}` — dismiss cookie/GDPR banner
+- `{{"type": "press_key", "key": "Enter"}}` — press keyboard key
+- `{{"type": "select_option", "selector": "CSS selector", "value": "option value"}}` — select dropdown
+
+## Rules
+- Return at most 5 actions per response
+- Prefer `dismiss_overlay` FIRST if cookie/GDPR banners are detected
+- Only return actions you are confident about — false positives waste time
+- If the page is already fully loaded and CSS selectors should work, return empty `browser_actions` and improve your `field_configs` instead
+- Set `needs_visual_pass: true` if you suspect the page uses dynamic class names or canvas rendering
+
+## Response Format
+Write your JSON response to: {output_path}
+
+Use the standard AgentResponse format with these additions:
+```json
+{{
+  "status": "success",
+  "browser_actions": [...],
+  "needs_visual_pass": false,
+  "field_configs": [...],
+  "confidence": 0.7
+}}
+```
+"#,
+        html_path = html_path.display(),
+        output_path = output_path.display(),
+        goal = goal,
+        l1_failure_reason = l1_failure_reason,
+    )
+}
+
+// ── Level 2: Post-action re-extraction prompt ─────────────────────────────────
+
+/// Build a Level 2 re-extraction prompt after browser actions were executed.
+///
+/// Claude receives the updated HTML (post-actions) and re-runs CSS selector discovery.
+pub fn build_post_action_prompt(
+    post_action_html_path: &std::path::Path,
+    output_path: &std::path::Path,
+    goal: &str,
+    executed_actions_json: &str,
+) -> String {
+    format!(r#"# Level 2: Post-Action Re-Extraction
+
+## Context
+Browser actions were executed on the page. Here is what was done:
+```json
+{executed_actions_json}
+```
+
+The page HTML has been re-captured after these actions.
+
+## Your Task
+1. Read the updated HTML file at: {post_action_html_path}
+2. Find CSS selectors for the data specified in the goal
+3. Return standard AgentResponse with `field_configs`
+
+## Goal
+{goal}
+
+## Response Format
+Write your JSON response to: {output_path}
+
+Use the standard AgentResponse format:
+```json
+{{
+  "status": "success",
+  "field_configs": [...],
+  "confidence": 0.8,
+  "browser_actions": []
+}}
+```
+
+Do NOT return more browser_actions unless absolutely necessary. This is a re-extraction pass — focus on finding selectors in the updated DOM.
+"#,
+        post_action_html_path = post_action_html_path.display(),
+        output_path = output_path.display(),
+        goal = goal,
+        executed_actions_json = executed_actions_json,
+    )
+}
+
+// ── Level 3: Visual prompt ────────────────────────────────────────────────────
+
+/// Build a Level 3 (visual) prompt for Claude Vision.
+///
+/// Claude reads a screenshot PNG and identifies interactive elements by appearance.
+pub fn build_visual_prompt(
+    screenshot_path: &std::path::Path,
+    output_path: &std::path::Path,
+    goal: &str,
+    html_hint: &str,
+) -> String {
+    let html_context = if html_hint.is_empty() {
+        String::new()
+    } else {
+        format!("\n## HTML Hint (may be incomplete)\n```html\n{}\n```\n",
+            &html_hint[..html_hint.len().min(2000)])
+    };
+
+    format!(r#"# Level 3: Visual Extraction
+
+## Context
+CSS selectors (Level 1) and browser interactions (Level 2) both failed to extract sufficient data. You now have a screenshot of the page to work with.
+
+## Your Task
+1. Read the screenshot at: {screenshot_path}
+2. Describe what you see on the page (layout, visible data, buttons, forms)
+3. Identify any interactive elements that could reveal data (buttons, expandable sections, tabs)
+4. Return `visual_actions` with coordinates of elements to interact with
+{html_context}
+## Goal
+{goal}
+
+## Visual Actions You Can Return
+Each action is a JSON object with an `action` field:
+- `{{"action": "click", "x": 150.0, "y": 300.0, "description": "Load More button at bottom"}}` — click at coordinates
+- `{{"action": "type", "x": 50.0, "y": 100.0, "text": "search query", "description": "search input field"}}` — type at coordinates
+- `{{"action": "scroll", "delta_y": 500, "description": "scroll down to see more content"}}` — scroll
+- `{{"action": "no_action", "reason": "page content is fully visible, no interactions needed"}}` — nothing to do
+
+Coordinates are viewport-relative pixels (top-left is 0,0).
+
+## Response Format
+Write your JSON response to: {output_path}
+
+```json
+{{
+  "status": "success",
+  "visual_actions": [...],
+  "field_configs": [...],
+  "confidence": 0.5
+}}
+```
+"#,
+        screenshot_path = screenshot_path.display(),
+        output_path = output_path.display(),
+        goal = goal,
+        html_context = html_context,
+    )
+}

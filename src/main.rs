@@ -56,6 +56,15 @@ enum Command {
         /// Directory to save discovered profile (default: output/<domain>/)
         #[arg(short, long)]
         output_dir: Option<PathBuf>,
+        /// Maximum extraction level (1=CSS, 2=interactive, 3=visual, 4=captcha)
+        #[arg(long, default_value = "3")]
+        max_level: u8,
+        /// Minimum records before considering extraction successful
+        #[arg(long, default_value = "1")]
+        min_records: usize,
+        /// Minimum confidence before considering extraction successful
+        #[arg(long, default_value = "0.5")]
+        min_confidence: f64,
     },
 
     /// Extract data from a URL using a saved site profile
@@ -183,7 +192,10 @@ async fn main() -> Result<()> {
             wait_selector,
             model,
             output_dir,
-        } => cmd_discover(url, goal, !http_only, wait_selector, model, output_dir, signer, browser_opts).await,
+            max_level,
+            min_records,
+            min_confidence,
+        } => cmd_discover(url, goal, !http_only, wait_selector, model, output_dir, signer, browser_opts, max_level, min_records, min_confidence).await,
 
         Command::Extract {
             url,
@@ -616,6 +628,11 @@ fn build_site_profile(
 
 // ─── commands ────────────────────────────────────────────────────────────────
 
+/// Decide whether L1 results are insufficient and we should try a higher level.
+fn should_escalate(records: usize, confidence: f64, min_records: usize, min_confidence: f64) -> bool {
+    records < min_records || confidence < min_confidence
+}
+
 async fn cmd_discover(
     url_str: String,
     goal: String,
@@ -625,6 +642,9 @@ async fn cmd_discover(
     output_dir: Option<PathBuf>,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
     mut browser_opts: BrowserOpts,
+    max_level: u8,
+    min_records: usize,
+    min_confidence: f64,
 ) -> Result<()> {
     println!("Discovering site structure for: {url_str}");
     println!("Goal: {goal}");
@@ -747,7 +767,7 @@ async fn cmd_discover(
     // 5. Apply SelectorExtractor to validate on the same page
     println!("[5/5] Validating selectors on fetched page...");
     let extractor = dig2crawl::parser::SelectorExtractor::new();
-    let extracted_records = extractor.extract(&page.body, &profile);
+    let mut extracted_records = extractor.extract(&page.body, &profile);
 
     println!("      Extracted {} record(s) with discovered selectors", extracted_records.len());
 
@@ -801,6 +821,131 @@ async fn cmd_discover(
         }
     } else {
         println!("      No records extracted — validation skipped");
+    }
+
+    // ─── Level escalation ─────────────────────────────────────────────
+    let mut current_level: u8 = 1;
+
+    // --- L2: Interactive escalation ---
+    if browser
+        && max_level >= 2
+        && should_escalate(extracted_records.len(), profile.confidence, min_records, min_confidence)
+    {
+        println!();
+        println!("[L2] Escalating to interactive extraction (clicks/scrolls)...");
+        current_level = 2;
+
+        // Ask Claude for browser actions
+        let l1_failure_reason = format!(
+            "only {} record(s) extracted (need {}, confidence {:.2} below {:.2})",
+            extracted_records.len(), min_records, profile.confidence, min_confidence,
+        );
+        let interactive_prompt = dig2crawl::agent::prompts::build_interactive_prompt(
+            &html_path,
+            &job_dir.join("l2_response.json"),
+            &goal,
+            &l1_failure_reason,
+        );
+        let l2_prompt_path = job_dir.join("l2_prompt.md");
+        let l2_response_path = job_dir.join("l2_response.json");
+        tokio::fs::write(&l2_prompt_path, &interactive_prompt).await?;
+
+        if session.send_with_files(&l2_prompt_path, &l2_response_path).await.is_ok() {
+            let l2_raw = tokio::fs::read_to_string(&l2_response_path).await.unwrap_or_default();
+            if let Ok(l2_resp) = parse_agent_response(&l2_raw) {
+                if !l2_resp.browser_actions.is_empty() {
+                    println!("      Claude suggested {} browser action(s)", l2_resp.browser_actions.len());
+
+                    // We need a BrowserFetcher to open pages — extract from handle
+                    if let FetcherHandle::Browser(ref browser_fetcher) = handle {
+                        let parsed = url::Url::parse(&url_str)?;
+                        match browser_fetcher.fetch_with_actions(&parsed, &l2_resp.browser_actions).await {
+                            Ok(actioned_page) => {
+                                println!("      Actions executed — re-extracting...");
+                                let l2_records = extractor.extract(&actioned_page.body, &profile);
+                                println!("      L2 extracted {} record(s) (was {})", l2_records.len(), extracted_records.len());
+                                if l2_records.len() > extracted_records.len() {
+                                    extracted_records = l2_records;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("      L2 action execution failed: {e}");
+                            }
+                        }
+                    }
+                } else {
+                    println!("      Claude suggested no browser actions — skipping L2");
+                }
+            }
+        }
+    }
+
+    // --- L3: Visual escalation ---
+    if browser
+        && max_level >= 3
+        && current_level < 3
+        && should_escalate(extracted_records.len(), profile.confidence, min_records, min_confidence)
+    {
+        println!();
+        println!("[L3] Escalating to visual extraction (screenshot + Claude Vision)...");
+
+        if let FetcherHandle::Browser(ref browser_fetcher) = handle {
+            let parsed = url::Url::parse(&url_str)?;
+            match browser_fetcher.open_page(&parsed).await {
+                Ok(live_page) => {
+                    let screenshot = live_page.screenshot().await.unwrap_or_default();
+                    if !screenshot.is_empty() {
+                        let screenshot_path = job_dir.join("l3_screenshot.png");
+                        tokio::fs::write(&screenshot_path, &screenshot).await?;
+                        println!("      Screenshot captured ({} bytes)", screenshot.len());
+
+                        let visual_prompt = dig2crawl::agent::prompts::build_visual_prompt(
+                            &screenshot_path,
+                            &job_dir.join("l3_response.json"),
+                            &goal,
+                            &page.body,
+                        );
+                        let l3_prompt_path = job_dir.join("l3_prompt.md");
+                        let l3_response_path = job_dir.join("l3_response.json");
+                        tokio::fs::write(&l3_prompt_path, &visual_prompt).await?;
+
+                        if session.send_with_files(&l3_prompt_path, &l3_response_path).await.is_ok() {
+                            let l3_raw = tokio::fs::read_to_string(&l3_response_path).await.unwrap_or_default();
+                            if let Ok(l3_resp) = parse_agent_response(&l3_raw) {
+                                if !l3_resp.visual_actions.is_empty() {
+                                    println!("      Claude Vision suggested {} action(s)", l3_resp.visual_actions.len());
+                                    // Convert visual actions to browser actions and execute
+                                    let browser_actions: Vec<dig2crawl::agent::actions::BrowserAction> =
+                                        l3_resp.visual_actions.iter().filter_map(|va| va.to_browser_action()).collect();
+                                    let outcome = dig2crawl::fetch::interactive::execute_actions(&live_page, &browser_actions).await;
+                                    match outcome {
+                                        Ok(result) => {
+                                            println!("      Visual actions executed — re-extracting...");
+                                            let l3_records = extractor.extract(&result.html, &profile);
+                                            println!("      L3 extracted {} record(s) (was {})", l3_records.len(), extracted_records.len());
+                                            if l3_records.len() > extracted_records.len() {
+                                                extracted_records = l3_records;
+                                            }
+                                        }
+                                        Err(e) => eprintln!("      L3 visual action execution failed: {e}"),
+                                    }
+                                } else {
+                                    println!("      Claude Vision suggested no actions");
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("      L3 page open failed: {e}"),
+            }
+        }
+    }
+
+    // --- L4: Captcha detection (architecture stub) ---
+    if max_level >= 4 && antibot.detected {
+        println!();
+        println!("[L4] Captcha/anti-bot detected but L4 solver is not implemented.");
+        println!("     See dig2crawl::agent::captcha for the trait interface.");
     }
 
     session.close().await;
