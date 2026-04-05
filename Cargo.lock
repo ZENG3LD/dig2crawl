@@ -589,9 +589,9 @@ dependencies = [
 
 [[package]]
 name = "dig2browser"
-version = "0.4.8"
+version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a36f357c9c38b0d9a3cff6c1cf09ea4fb5139dcc3eae410dfde944060b1dc36f"
+checksum = "a8737058a0b05dbe161c0693b7a7c1e9ae642e15252019eb09a22bd814f4474d"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "dig2crawl"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "ahash",
  "anyhow",
