@@ -1,19 +1,17 @@
 # dig2crawl
 
-Universal agnostic web crawler with Claude-powered CSS selector discovery.
+Universal agnostic web crawler with multi-level AI extraction.
 
-Given a URL and a natural-language goal, Claude reads the raw HTML, discovers
-CSS selectors, validates extraction, and produces a `SiteProfile` — a
-reusable config for machine-loop extraction without any agent involvement.
+Given a URL and a natural-language goal, the crawler auto-escalates through 4 extraction levels — CSS selectors → browser interactions → visual (screenshot + Claude Vision) → captcha — until enough data is extracted.
 
 ## What it does
 
-- Fetches a page (plain HTTP or stealth headless browser via dig2browser)
-- Detects anti-bot protection, extracts JSON-LD and page metadata
-- Runs a Claude agent session that reads the HTML, discovers container + field selectors, and writes a structured JSON response
-- Validates discovered selectors by running the pure-Rust `SelectorExtractor` on the same page and asking Claude to confirm data quality
-- Saves a `SiteProfile` (container selector, field selectors, pagination config, confidence score)
-- Exports a `DaemonSpec` for scheduled monitoring — consumed by external daemons via cron or watchdog
+- **L1 — CSS selectors**: Claude reads raw HTML, discovers container + field selectors, validates extraction, produces a reusable `SiteProfile`
+- **L2 — Interactive**: When L1 yields too few records, Claude suggests browser actions (clicks, scrolls, dismiss overlays) and the crawler executes them via dig2browser, then re-extracts
+- **L3 — Visual**: When L2 still falls short, takes a screenshot, sends it to Claude Vision for coordinate-based actions (click at x,y), executes them, re-extracts
+- **L4 — Captcha**: Architecture stub with `CaptchaSolver` trait — not implemented unless forced by life
+- Detects anti-bot protection, extracts JSON-LD and page metadata as bonus context
+- Saves a `SiteProfile` and exports a `DaemonSpec` for scheduled monitoring
 
 ## Architecture
 
@@ -22,11 +20,11 @@ Single-crate layout — all modules live under `src/`:
 ```
 dig2crawl/
 ├── src/
-│   ├── main.rs    — CLI binary (clap)
+│   ├── main.rs    — CLI binary (clap) + escalation coordinator
 │   ├── lib.rs     — Library root
 │   ├── core/      — Types, traits, error types, rate limiter, engine
-│   ├── fetch/     — HttpFetcher (reqwest) + BrowserFetcher (dig2browser stealth)
-│   ├── agent/     — AgentSession (Claude CLI bridge), prompts (discovery + validation)
+│   ├── fetch/     — HttpFetcher, BrowserFetcher, interactive action executor
+│   ├── agent/     — AgentSession, prompts, protocol, actions, visual, captcha
 │   ├── parser/    — SelectorExtractor, JsonLdExtractor, AntiBotDetector, MetadataExtractor, LinkExtractor
 │   ├── config/    — TOML job config, SiteProfile, DaemonSpec serialisation
 │   └── storage/   — SQLite + JSONL output backends
@@ -34,13 +32,19 @@ dig2crawl/
 
 ## How it works
 
-Discovery runs in 5 steps:
+Discovery runs in 5 steps + escalation:
 
 1. **Fetch** — page is fetched via HTTP or headless browser; anti-bot check runs immediately
 2. **Context extraction** — JSON-LD blocks and page metadata are extracted and injected into the agent prompt as bonus context
-3. **Discovery** — Claude reads `page.html` from disk (using its `Read` tool), analyses the DOM, and writes `response.json` with container selector, field selectors, pagination config, and confidence score
-4. **Validation** — the pure-Rust `SelectorExtractor` applies the discovered selectors; Claude reviews the extracted sample in a follow-up turn of the same session and emits a `validation_result` block
-5. **Save** — `SiteProfile` is written to `output/<domain>/profile.json`; temp files are removed
+3. **Discovery (L1)** — Claude reads `page.html` from disk, analyses the DOM, writes selectors + confidence score
+4. **Validation** — the pure-Rust `SelectorExtractor` applies discovered selectors; Claude reviews the sample
+5. **Save** — `SiteProfile` is written to `output/<domain>/profile.json`
+
+**Escalation** — if L1 yields fewer records than `--min-records` or confidence below `--min-confidence`:
+
+6. **L2 Interactive** — Claude suggests `BrowserAction`s (Click, ScrollTo, DismissOverlay, Type, WaitForElement, etc.), the crawler executes them on a live browser page, then re-extracts with the same selectors
+7. **L3 Visual** — a screenshot is taken and sent to Claude Vision; Claude responds with coordinate-based `VisualAction`s (click at x,y), which are converted to browser actions and executed
+8. **L4 Captcha** — if anti-bot is detected and `--max-level 4`, prints a warning (solver trait exists but is not implemented)
 
 After discovery, `extract` applies the saved profile in pure Rust — no agent needed.
 
@@ -105,6 +109,11 @@ dig2crawl discover <url> --goal "Extract VPS plans: name, price, cpu, ram, disk"
 dig2crawl discover <url> --goal "..." --wait-selector "div.tariffs"
 dig2crawl discover <url> --goal "..." --http-only --output-dir ./profiles/mysite
 
+# Discover with escalation control
+dig2crawl discover <url> --goal "..." --max-level 2          # stop at L2 (no visual)
+dig2crawl discover <url> --goal "..." --min-records 5         # escalate until 5+ records
+dig2crawl discover <url> --goal "..." --min-confidence 0.8    # escalate until 80% confidence
+
 # Extract data using a saved profile (pure Rust, no agent)
 dig2crawl extract <url> --profile output/<domain>/profile.json
 dig2crawl extract <url> --profile output/<domain>/profile.json --max-pages 5 --output records.jsonl
@@ -132,6 +141,9 @@ Global flags:
 - `--fingerprint <PATH>` — JSON fingerprint config (locale, timezone, viewport, stealth level, etc.)
 - `--bot-auth <JWKS_URL>` — enable Web Bot Auth signing
 - `--bot-key <PATH>` — Ed25519 private key for bot auth (default: `keys/bot.key`)
+- `--max-level <N>` — maximum extraction level: 1=CSS, 2=interactive, 3=visual (default: 3)
+- `--min-records <N>` — minimum records before considering L1 successful (default: 1)
+- `--min-confidence <F>` — minimum confidence threshold (default: 0.5)
 
 ## Cookie auth (`cookie-auth` binary)
 
@@ -192,7 +204,12 @@ See [dig2browser README](https://github.com/ZENG3LD/dig2browser#cli-tools) for f
 ├── prompt.md                  — discovery instructions for Claude
 ├── response.json              — Claude's discovery JSON response
 ├── validation_prompt.md       — validation instructions for Claude
-└── validation_response.json   — Claude's validation JSON response
+├── validation_response.json   — Claude's validation JSON response
+├── l2_prompt.md               — L2 interactive prompt (if escalated)
+├── l2_response.json           — L2 browser actions response
+├── l3_screenshot.png          — L3 page screenshot (if escalated)
+├── l3_prompt.md               — L3 visual prompt
+└── l3_response.json           — L3 visual actions response
 ```
 
 The directory is deleted when the session closes.
