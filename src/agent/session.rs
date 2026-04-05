@@ -22,6 +22,7 @@ pub struct AgentSession {
     resume_session_id: Option<String>,
     system_prompt: Option<String>,
     timeout_secs: u64,
+    model: Option<String>,
 }
 
 impl AgentSession {
@@ -34,12 +35,19 @@ impl AgentSession {
             resume_session_id: None,
             system_prompt: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            model: None,
         })
     }
 
     /// Override the per-prompt timeout (default: 600 s).
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
+        self
+    }
+
+    /// Override the Claude model passed to `--model` (default: None = claude CLI default).
+    pub fn with_model(mut self, model: String) -> Self {
+        self.model = Some(model);
         self
     }
 
@@ -71,7 +79,7 @@ impl AgentSession {
             claude: ClaudeOptions {
                 resume_session_id: self.resume_session_id.clone(),
                 append_system_prompt: self.system_prompt.clone(),
-                model: None,
+                model: self.model.clone(),
             },
             ..PipeProcessOptions::default()
         };

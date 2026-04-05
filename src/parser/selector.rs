@@ -162,6 +162,7 @@ mod tests {
             validated: true,
             created_at: Utc::now(),
             last_used_at: Utc::now(),
+            extraction_mode: crate::core::types::ExtractionMode::default(),
         }
     }
 

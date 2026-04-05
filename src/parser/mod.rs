@@ -8,12 +8,14 @@
 //! - [`links`]    — outbound link extraction with relative URL resolution
 
 pub mod antibot;
+pub mod json_data;
 pub mod jsonld;
 pub mod links;
 pub mod metadata;
 pub mod selector;
 
 pub use antibot::{AntiBotResult, AntiBotDetector};
+pub use json_data::{extract_spa_json, SpaJsonBlock, SpaSource};
 pub use jsonld::JsonLdExtractor;
 pub use links::LinkExtractor;
 pub use metadata::{PageMetadata, MetadataExtractor};

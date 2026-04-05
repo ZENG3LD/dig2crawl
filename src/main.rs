@@ -465,20 +465,20 @@ fn sanitize_json_escapes(s: &str) -> String {
             '\\' if in_string => {
                 match chars.peek().copied() {
                     Some(next) if is_valid_json_escape(next) => {
-                        // Valid escape — emit as-is.
+                        // Valid escape — emit both the backslash and the escaped char.
+                        // We MUST consume the next char to prevent the state machine
+                        // from misinterpreting it (e.g. `\"` would toggle in_string,
+                        // `\\` would start a new escape sequence).
                         out.push('\\');
-                        // `\uXXXX` — also consume the four hex digits so the
-                        // peek-based state machine stays in sync.
+                        out.push(chars.next().unwrap()); // consume the escaped char
+                        // `\uXXXX` — also consume the four hex digits.
                         if next == 'u' {
-                            out.push(chars.next().unwrap()); // 'u'
                             for _ in 0..4 {
                                 if let Some(h) = chars.next() {
                                     out.push(h);
                                 }
                             }
                         }
-                        // For all other valid escapes the next iteration handles
-                        // the escaped character naturally.
                     }
                     Some(_) => {
                         // Invalid escape: double the backslash so the sequence
@@ -521,6 +521,48 @@ fn extract_json_block(s: &str) -> &str {
         }
     }
     s.trim()
+}
+
+/// Check if a raw agent response string signals auto-navigation.
+///
+/// Claude may return `{"status": "navigate", "target_url": "https://..."}` when
+/// it determines the current page does not contain the goal data. Returns the
+/// target URL if found, or `None` if this is a normal response.
+fn extract_navigate_target(raw: &str) -> Option<String> {
+    let json_str = extract_json_block(raw);
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let status = val.get("status").and_then(|v| v.as_str())?;
+    if status != "navigate" {
+        return None;
+    }
+    val.get("target_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Extract `ExtractionMode::JsonPath` from an `AgentResponse` if Claude returned
+/// `"extraction_mode": "json_path"` with `json_source` and `json_base_path`.
+fn extract_json_path_mode(
+    response: &dig2crawl::agent::protocol::AgentResponse,
+) -> Option<dig2crawl::core::types::ExtractionMode> {
+    use dig2crawl::core::types::ExtractionMode;
+
+    // Claude may embed these fields as extra keys in the root of its JSON response.
+    // We check `updated_memory.notes` first (Claude sometimes puts extras there),
+    // then fall back to checking if the raw AgentResponse serde captured extra fields.
+    // The simplest approach: re-serialize and parse as a generic Value.
+    let raw_val = serde_json::to_value(response).ok()?;
+    let mode_str = raw_val.get("extraction_mode").and_then(|v| v.as_str())?;
+    if mode_str != "json_path" {
+        return None;
+    }
+    let json_source = raw_val.get("json_source")?.as_str()?.to_string();
+    let base_path = raw_val.get("json_base_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(ExtractionMode::JsonPath { json_source, base_path })
 }
 
 /// Build a `dig2crawl::core::types::SiteProfile` from an `AgentResponse`.
@@ -623,6 +665,7 @@ fn build_site_profile(
         validated: false,
         created_at: now,
         last_used_at: now,
+        extraction_mode: dig2crawl::core::types::ExtractionMode::default(),
     })
 }
 
@@ -631,6 +674,58 @@ fn build_site_profile(
 /// Decide whether L1 results are insufficient and we should try a higher level.
 fn should_escalate(records: usize, confidence: f64, min_records: usize, min_confidence: f64) -> bool {
     records < min_records || confidence < min_confidence
+}
+
+/// Extract records from SPA JSON blocks using the `JsonPath` extraction mode
+/// stored in the profile.
+///
+/// Walks to `base_path` inside the matching JSON block and returns the array
+/// of JSON objects found there. Returns an empty vec if anything is missing.
+fn extract_via_json_path(
+    json_blocks: &[dig2crawl::parser::SpaJsonBlock],
+    profile: &dig2crawl::core::types::SiteProfile,
+) -> Vec<serde_json::Value> {
+    use dig2crawl::core::types::ExtractionMode;
+
+    let (json_source, base_path) = match &profile.extraction_mode {
+        ExtractionMode::JsonPath { json_source, base_path } => (json_source.as_str(), base_path.as_str()),
+        ExtractionMode::CssSelectors => return Vec::new(),
+    };
+
+    // Find the matching block by source display name.
+    let block = json_blocks.iter().find(|b| b.source.display_name() == json_source);
+    // Also accept the first block if there is only one and the name is a generic marker.
+    let block = block.or_else(|| {
+        if json_blocks.len() == 1 { json_blocks.first() } else { None }
+    });
+
+    let block = match block {
+        Some(b) => b,
+        None => {
+            tracing::warn!(json_source, "No SPA JSON block found for json_path extraction");
+            return Vec::new();
+        }
+    };
+
+    // Walk to the base path.
+    let node = dig2crawl::parser::json_data::navigate_json_path(&block.data, base_path);
+    match node {
+        Some(serde_json::Value::Array(arr)) => {
+            // Return only objects; skip primitives/nulls.
+            arr.iter()
+                .filter(|v| v.is_object())
+                .cloned()
+                .collect()
+        }
+        Some(other) if other.is_object() => {
+            // Single object — wrap in vec.
+            vec![other.clone()]
+        }
+        _ => {
+            tracing::warn!(base_path, "base_path did not resolve to an array in SPA JSON");
+            Vec::new()
+        }
+    }
 }
 
 /// Strip noise from HTML to stay within Claude Code's Read tool token limit (~10 000 tokens).
@@ -671,7 +766,7 @@ async fn cmd_discover(
     goal: String,
     browser: bool,
     wait_selector: Option<String>,
-    _model: String,
+    model: String,
     output_dir: Option<PathBuf>,
     signer: Option<Arc<dig2browser::bot_auth::RequestSigner>>,
     mut browser_opts: BrowserOpts,
@@ -708,6 +803,15 @@ async fn cmd_discover(
         println!("      Clean (no anti-bot detected)");
     }
 
+    // 2b. Extract SPA JSON BEFORE stripping HTML noise (script tags removed by stripper).
+    let spa_blocks = dig2crawl::parser::extract_spa_json(&page.body);
+    if !spa_blocks.is_empty() {
+        println!("      SPA JSON: {} block(s) found ({})",
+            spa_blocks.len(),
+            spa_blocks.iter().map(|b| b.source.display_name()).collect::<Vec<_>>().join(", "),
+        );
+    }
+
     // 3. Extract JSON-LD and metadata as bonus context
     println!("[3/5] Extracting JSON-LD and metadata...");
     let jsonld_items = dig2crawl::parser::JsonLdExtractor::extract_jsonld(&page.body);
@@ -724,7 +828,8 @@ async fn cmd_discover(
     println!("[4/5] Starting Claude session...");
     let mut session = dig2crawl::agent::session::AgentSession::start()
         .await
-        .context("Failed to start Claude agent session. Is `claude` CLI installed?")?;
+        .context("Failed to start Claude agent session. Is `claude` CLI installed?")?
+        .with_model(model);
 
     // Create a per-run job directory in the system temp dir
     // Use USERPROFILE-based temp path to avoid Windows 8.3 short names (VAPC~1)
@@ -741,6 +846,29 @@ async fn cmd_discover(
     tokio::fs::create_dir_all(&job_dir)
         .await
         .with_context(|| format!("Failed to create job dir: {}", job_dir.display()))?;
+
+    // Save SPA JSON to file so Claude can read it directly.
+    let spa_json_path: Option<std::path::PathBuf> = if !spa_blocks.is_empty() {
+        let path = job_dir.join("spa_data.json");
+        let combined: Vec<serde_json::Value> = spa_blocks.iter()
+            .map(|b| serde_json::json!({
+                "source": b.source.display_name(),
+                "data": &b.data,
+            }))
+            .collect();
+        let json_bytes = serde_json::to_string_pretty(&combined).unwrap_or_default();
+        tokio::fs::write(&path, &json_bytes)
+            .await
+            .with_context(|| format!("Failed to write SPA JSON to {}", path.display()))?;
+        println!("      SPA JSON saved to: {}", path.display());
+        Some(path)
+    } else {
+        None
+    };
+
+    // The SPA source name used in the prompt (first block's display name).
+    let spa_source_name: Option<String> = spa_blocks.first()
+        .map(|b| b.source.display_name().to_string());
 
     // Save cleaned HTML to file — Claude reads it via its Read tool (using offset/limit for large files).
     // Strip <script>, <style>, <svg>, <noscript> tags and collapse whitespace to reduce noise.
@@ -770,8 +898,12 @@ async fn cmd_discover(
 
     // Build the discovery prompt — Claude reads HTML via its Read tool,
     // returns JSON as text (no file write needed)
-    let discovery_prompt =
-        dig2crawl::agent::prompts::build_discovery_prompt(&html_path, &full_goal);
+    let discovery_prompt = dig2crawl::agent::prompts::build_discovery_prompt(
+        &html_path,
+        &full_goal,
+        spa_json_path.as_deref(),
+        spa_source_name.as_deref(),
+    );
 
     println!(
         "      Sending discovery prompt ({} chars, HTML: {} bytes)...",
@@ -786,9 +918,67 @@ async fn cmd_discover(
 
     tracing::debug!(response_len = discovery_raw.len(), "Discovery response received");
 
-    // Parse response
-    let discovery_response = parse_agent_response(&discovery_raw)
-        .context("Could not parse discovery response")?;
+    // Check for auto-navigation response: Claude signals the current page is not
+    // the right page (e.g. homepage) and provides a target URL to fetch instead.
+    // We allow up to 2 redirects to prevent infinite loops.
+    let (discovery_response, page, _url_str_final) = {
+        let mut resp_raw = discovery_raw;
+        let mut current_page = page;
+        let mut current_url = url_str.clone();
+        let mut nav_count = 0u8;
+
+        loop {
+            // Check if response is a plain navigate object (may not parse as AgentResponse).
+            let nav_target = extract_navigate_target(&resp_raw);
+
+            if let Some(target_url) = nav_target {
+                if nav_count >= 2 {
+                    println!("      Auto-navigation limit reached (max 2) — stopping at {current_url}");
+                    break;
+                }
+                println!("      Auto-navigate → {target_url}");
+                nav_count += 1;
+                current_url = target_url.clone();
+
+                // Fetch the new page.
+                match fetch_page(handle.as_fetcher(), &target_url).await {
+                    Ok(new_page) => {
+                        current_page = new_page;
+
+                        // Re-run SPA JSON extraction on new page (already committed spa_blocks above,
+                        // but we re-save if found).
+                        let new_html_cleaned = strip_html_noise(&current_page.body);
+                        let _ = tokio::fs::write(&html_path, &new_html_cleaned).await;
+
+                        // Rebuild and re-send discovery prompt for the new page.
+                        let new_prompt = dig2crawl::agent::prompts::build_discovery_prompt(
+                            &html_path,
+                            &full_goal,
+                            spa_json_path.as_deref(),
+                            spa_source_name.as_deref(),
+                        );
+                        match session.send_prompt(&new_prompt).await {
+                            Ok(raw) => { resp_raw = raw; }
+                            Err(e) => {
+                                eprintln!("      Discovery re-prompt after navigate failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("      Auto-navigate fetch failed: {e}");
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        let resp = parse_agent_response(&resp_raw)
+            .context("Could not parse discovery response")?;
+        (resp, current_page, current_url)
+    };
 
     // Extract domain for profile
     let domain = parsed_url
@@ -796,8 +986,17 @@ async fn cmd_discover(
         .unwrap_or("unknown")
         .to_string();
 
+    // Check if Claude returned json_path extraction mode.
+    let extraction_mode = extract_json_path_mode(&discovery_response);
+
     // Build SiteProfile from discovery response
     let mut profile = build_site_profile(&domain, &discovery_response, browser)?;
+
+    // Apply json_path extraction mode if Claude discovered it.
+    if let Some(mode) = extraction_mode {
+        profile.extraction_mode = mode;
+        println!("      Extraction mode: JsonPath (SPA JSON)");
+    }
 
     println!(
         "      Discovered {} field(s), container: {:?}, confidence: {:.2}",
@@ -806,10 +1005,20 @@ async fn cmd_discover(
         profile.confidence,
     );
 
-    // 5. Apply SelectorExtractor to validate on the same page
+    // 5. Apply extractor to validate on the same page
     println!("[5/5] Validating selectors on fetched page...");
     let extractor = dig2crawl::parser::SelectorExtractor::new();
-    let mut extracted_records = extractor.extract(&page.body, &profile);
+    let mut extracted_records = match &profile.extraction_mode {
+        dig2crawl::core::types::ExtractionMode::JsonPath { .. } => {
+            // Use JSON path extraction when Claude detected a SPA JSON source.
+            let records = extract_via_json_path(&spa_blocks, &profile);
+            println!("      JsonPath extraction: {} record(s)", records.len());
+            records
+        }
+        dig2crawl::core::types::ExtractionMode::CssSelectors => {
+            extractor.extract(&page.body, &profile)
+        }
+    };
 
     println!("      Extracted {} record(s) with discovered selectors", extracted_records.len());
 
@@ -1127,6 +1336,7 @@ async fn cmd_extract(
                     validated: true,
                     created_at: profile.created_at,
                     last_used_at: profile.last_used_at,
+                    extraction_mode: dig2crawl::core::types::ExtractionMode::default(),
                 };
                 let nav_extractor = dig2crawl::parser::SelectorExtractor::new();
                 let nav_records = nav_extractor.extract(&page.body, &nav_profile);
@@ -1293,7 +1503,7 @@ async fn cmd_test_selector(
     mut browser_opts: BrowserOpts,
 ) -> Result<()> {
     use chrono::Utc;
-    use dig2crawl::core::types::{ExtractMode, FieldConfig, SiteProfile};
+    use dig2crawl::core::types::{ExtractionMode, ExtractMode, FieldConfig, SiteProfile};
 
     browser_opts.resolve_profile(&url_str);
     let handle = make_fetcher(browser, None, signer, browser_opts).await?;
@@ -1351,6 +1561,7 @@ async fn cmd_test_selector(
         validated: true,
         created_at: now,
         last_used_at: now,
+        extraction_mode: ExtractionMode::default(),
     };
 
     let extractor = dig2crawl::parser::SelectorExtractor::new();

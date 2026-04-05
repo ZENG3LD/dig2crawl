@@ -10,6 +10,8 @@ Given a URL and a natural-language goal, the crawler auto-escalates through 4 ex
 - **L2 — Interactive**: When L1 yields too few records, Claude suggests browser actions (clicks, scrolls, dismiss overlays) and the crawler executes them via dig2browser, then re-extracts
 - **L3 — Visual**: When L2 still falls short, takes a screenshot, sends it to Claude Vision for coordinate-based actions (click at x,y), executes them, re-extracts
 - **L4 — Captcha**: Architecture stub with `CaptchaSolver` trait — not implemented unless forced by life
+- **Auto-navigation** — if Claude lands on a homepage/landing without data, it finds the right sub-page (e.g. `/vps/`) and redirects automatically (up to 2 hops)
+- **SPA JSON extraction** — detects `__NEXT_DATA__` (Next.js), `__NUXT_DATA__` (Nuxt), `window.__NUXT__`, `window.__INITIAL_STATE__` before HTML stripping removes `<script>` tags; Claude can return `json_path` extraction mode instead of CSS selectors
 - Detects anti-bot protection, extracts JSON-LD and page metadata as bonus context
 - Saves a `SiteProfile` and exports a `DaemonSpec` for scheduled monitoring
 
@@ -25,7 +27,7 @@ dig2crawl/
 │   ├── core/      — Types, traits, error types, rate limiter, engine
 │   ├── fetch/     — HttpFetcher, BrowserFetcher, interactive action executor
 │   ├── agent/     — AgentSession, prompts, protocol, actions, visual, captcha
-│   ├── parser/    — SelectorExtractor, JsonLdExtractor, AntiBotDetector, MetadataExtractor, LinkExtractor
+│   ├── parser/    — SelectorExtractor, JsonLdExtractor, AntiBotDetector, MetadataExtractor, LinkExtractor, SpaJsonExtractor
 │   ├── config/    — TOML job config, SiteProfile, DaemonSpec serialisation
 │   └── storage/   — SQLite + JSONL output backends
 ```
@@ -35,8 +37,9 @@ dig2crawl/
 Discovery runs in 5 steps + escalation:
 
 1. **Fetch** — page is fetched via HTTP or headless browser; anti-bot check runs immediately
-2. **Context extraction** — JSON-LD blocks and page metadata are extracted and injected into the agent prompt as bonus context
-3. **Discovery (L1)** — Claude reads `page.html` from disk, analyses the DOM, writes selectors + confidence score
+2. **Context extraction** — SPA JSON blocks (`__NEXT_DATA__`, `__NUXT_DATA__`) extracted before HTML cleaning; JSON-LD and page metadata injected as bonus context
+3. **Auto-navigation** — if Claude determines the page is a homepage without target data, it returns a `navigate` response with the target URL; the crawler fetches the new page and restarts discovery (max 2 hops)
+4. **Discovery (L1)** — Claude reads `page.html` from disk, analyses the DOM, writes selectors + confidence score; for SPA sites it may return `json_path` extraction mode instead of CSS selectors
 4. **Validation** — the pure-Rust `SelectorExtractor` applies discovered selectors; Claude reviews the sample
 5. **Save** — `SiteProfile` is written to `output/<domain>/profile.json`
 
@@ -141,6 +144,7 @@ Global flags:
 - `--fingerprint <PATH>` — JSON fingerprint config (locale, timezone, viewport, stealth level, etc.)
 - `--bot-auth <JWKS_URL>` — enable Web Bot Auth signing
 - `--bot-key <PATH>` — Ed25519 private key for bot auth (default: `keys/bot.key`)
+- `--model <MODEL>` — Claude model to use (default: `claude-sonnet-4-6`)
 - `--max-level <N>` — maximum extraction level: 1=CSS, 2=interactive, 3=visual (default: 3)
 - `--min-records <N>` — minimum records before considering L1 successful (default: 1)
 - `--min-confidence <F>` — minimum confidence threshold (default: 0.5)
@@ -202,6 +206,7 @@ See [dig2browser README](https://github.com/ZENG3LD/dig2browser#cli-tools) for f
 ```
 %TEMP%/dig2crawl_<pid>/
 ├── page.html              — cleaned fetched HTML (scripts/styles stripped)
+├── spa_data.json           — extracted SPA JSON (if __NEXT_DATA__ / __NUXT_DATA__ found)
 ├── l2_page.html           — post-action HTML (if L2 escalated)
 └── l3_screenshot.png      — page screenshot (if L3 escalated)
 ```
@@ -210,24 +215,26 @@ The directory is deleted when the session closes.
 
 **Robust JSON parsing** — the agent protocol tolerates several classes of model output variation:
 
-- Regex escape sequences in `transform` patterns (e.g. `\\d+`) parsed without double-escape errors
+- Regex escape sequences in `transform` patterns (e.g. `\\d+`, `\\\s*`) sanitized — the state machine correctly consumes both characters of valid JSON escapes (`\\`, `\"`) before inspecting the next character
 - `null` selectors for fields absent from the page (skipped gracefully, not treated as errors)
 - Untagged `next_urls` values — accepted as either a plain string or a `{"url": "..."}` object
 - Mixed-type `url_patterns` and field specs — arrays and scalars both accepted at every field
 
 ## Batch crawl results
 
-Tested against 18 L2 (bare-metal / VPS) hosting providers to profile pricing pages.
+Tested against VPS hosting providers with auto-navigation and SPA extraction (v0.3.19):
 
-| Metric | Result |
-|--------|--------|
-| Providers attempted | 18 |
-| Successfully profiled | 16 |
-| Validated (confidence >= 0.55) | 15 |
-| Average confidence | ~0.80 |
-| Recovered via browser mode | 3 (ruvds.com, hostkey.com, ishosting.com) |
+| Provider | Confidence | Records | Notes |
+|----------|-----------|---------|-------|
+| serverspace.io | 0.88 | 9 | L1 CSS selectors |
+| ruvds.com | 0.93 | 3 | L1, browser mode |
+| 4dedic.io | 0.92 | 4233 | L1, large catalog |
+| robovps.biz | 0.91 | 7 | Auto-nav homepage → /vps/ |
+| ishosting.com | 0.92 | 6 | Auto-nav ×2, through Cloudflare |
+| timeweb.cloud | 0.90 | 4 | L3 visual (Nuxt SPA) |
+| adminvps.ru | 0.88 | — | L1 CSS selectors |
 
-Sites that required `--browser` had JS-rendered pricing grids that returned empty containers under plain HTTP. Browser mode resolved all three.
+Auto-navigation successfully finds VPS pricing pages from homepages. SPA sites (Next.js, Nuxt) are handled via embedded JSON extraction or L3 visual fallback.
 
 ## Output
 

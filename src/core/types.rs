@@ -166,6 +166,26 @@ pub struct PageMeta {
 
 // ---- Site profile (learned by Claude, consumed by SelectorExtractor) ----
 
+/// Controls how records are extracted from a page.
+///
+/// `CssSelectors` is the default (and the only mode supported by `SelectorExtractor`).
+/// `JsonPath` is used when Claude discovered that the page embeds its data inside
+/// a SPA framework JSON block — in that case CSS selectors are not needed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum ExtractionMode {
+    /// Standard CSS-selector-based extraction (default).
+    #[default]
+    CssSelectors,
+    /// Data lives inside an embedded SPA JSON block; navigate with dot-paths.
+    JsonPath {
+        /// Which SPA source to read from, e.g. `"__NEXT_DATA__"`.
+        json_source: String,
+        /// Dot-path to the array of records inside the JSON tree,
+        /// e.g. `"props.pageProps.sectionCalculator.tabs"`.
+        base_path: String,
+    },
+}
+
 /// What Claude discovers about a site during Phase 1+2.
 /// Stored per domain, persisted to the site_profiles table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +203,9 @@ pub struct SiteProfile {
     pub validated: bool,
     pub created_at: DateTime<Utc>,
     pub last_used_at: DateTime<Utc>,
+    /// How to extract records from a fetched page.
+    #[serde(default)]
+    pub extraction_mode: ExtractionMode,
 }
 
 /// Rich per-field extraction spec learned by Claude, consumed by `SelectorExtractor`.

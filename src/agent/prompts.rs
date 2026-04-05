@@ -76,13 +76,77 @@ Your response MUST be a single valid JSON object:
 /// DOM, and returns the JSON response directly as its text output (no file write).
 ///
 /// The caller collects Claude's text response and parses JSON from it.
-pub fn build_discovery_prompt(html_path: &Path, goal: &str) -> String {
+///
+/// `spa_json_path` — if Some, points to a temp file containing extracted SPA JSON
+/// (e.g. from `__NEXT_DATA__`). The prompt instructs Claude to prefer JSON path
+/// extraction over CSS selectors in that case.
+///
+/// `spa_source_name` — display name of the SPA source (e.g. `"__NEXT_DATA__"`).
+pub fn build_discovery_prompt(
+    html_path: &Path,
+    goal: &str,
+    spa_json_path: Option<&Path>,
+    spa_source_name: Option<&str>,
+) -> String {
+    // Extra section injected when SPA JSON was found.
+    let spa_section = match (spa_json_path, spa_source_name) {
+        (Some(json_path), Some(source)) => format!(
+            r#"
+
+## IMPORTANT: This page contains embedded SPA JSON data
+
+The page contains embedded JSON data from a SPA framework (`{source}`).
+The extracted JSON has been saved to: {json_path}
+
+**Read this JSON file** (using the Read tool) to find the pricing/product data.
+Look for arrays of objects whose field names match the goal.
+
+If you find the target data in the JSON, return `"extraction_mode": "json_path"` in your response
+with `"json_source": "{source}"` and `"json_base_path": "<dot.path.to.array>"`.
+In that case you do NOT need CSS selectors — set `"container_selector": ""` and leave `"field_configs"` empty.
+
+Example for json_path mode:
+```json
+{{
+  "extraction_mode": "json_path",
+  "json_source": "{source}",
+  "json_base_path": "props.pageProps.plans"
+}}
+```
+"#,
+            json_path = json_path.display(),
+            source = source,
+        ),
+        _ => String::new(),
+    };
+
+    // Auto-navigation instruction injected when no SPA JSON was found.
+    let nav_section = if spa_json_path.is_none() {
+        r#"
+
+## Auto-navigation
+
+IMPORTANT: If this page does NOT contain the data described in the goal (e.g. it is a homepage,
+landing page, or marketing page without actual pricing/plan listings), then:
+
+1. Look for navigation links, menu items, or buttons that would lead to the actual data page.
+2. Return a JSON response with:
+   ```json
+   {{"status": "navigate", "target_url": "https://...", "reason": "Current page is homepage, pricing data is at /pricing"}}
+   ```
+The crawler will fetch that URL and re-run discovery on it.
+Only navigate if you are confident the current page does not contain the goal data.
+"#
+    } else {
+        ""
+    };
+
     format!(
         r#"You are a CSS selector discovery agent. Your task is to analyse HTML and find precise selectors for structured data extraction.
 
 ## Goal
 {goal}
-
+{spa_section}{nav_section}
 ## Instructions
 
 1. Use the Read tool to read the HTML file at: {html_path}
@@ -167,6 +231,8 @@ Return ONLY a single valid JSON object as your response text — no prose, no ma
 - Output exactly one JSON object. Do NOT wrap it in markdown fences."#,
         html_path = html_path.display(),
         goal = goal,
+        spa_section = spa_section,
+        nav_section = nav_section,
     )
 }
 
