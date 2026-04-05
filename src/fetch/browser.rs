@@ -4,28 +4,24 @@ use crate::core::traits::Fetcher;
 use crate::core::types::{FetchMethod, FetchedPage};
 use crate::fetch::retry::RetryConfig;
 use dig2browser::bot_auth::RequestSigner;
-use dig2browser::{BrowserPool, PoolConfig, StealthConfig};
+use dig2browser::{LaunchConfig, StealthBrowser, StealthConfig};
 use futures::future::BoxFuture;
 use std::sync::Arc;
 use std::time::Instant;
 use url::Url;
 
-/// Headless-browser fetcher backed by a `dig2browser::BrowserPool`.
+/// Browser fetcher backed by a `dig2browser::StealthBrowser`.
 ///
-/// Renders pages with stealth Chrome, making it suitable for JavaScript-heavy
-/// sites or pages that block plain HTTP clients.
+/// Uses `StealthBrowser` directly (not `BrowserPool`) — same pattern as
+/// `daemon4russian-parser`'s Yandex Maps enrichment daemon.
 ///
 /// Optionally retries failed navigations with exponential backoff when a
 /// [`RetryConfig`] is supplied.
 ///
 /// Optionally injects Web Bot Auth headers via a [`RequestSigner`].
 pub struct BrowserFetcher {
-    pool: BrowserPool,
+    browser: StealthBrowser,
     /// Optional CSS selector to wait for before capturing HTML.
-    ///
-    /// When set, the fetcher calls `page.wait().for_element(selector)` after
-    /// navigation. This ensures dynamic content has rendered before the HTML
-    /// is captured.
     wait_selector: Option<String>,
     /// Optional retry configuration.
     retry: Option<RetryConfig>,
@@ -34,40 +30,18 @@ pub struct BrowserFetcher {
 }
 
 impl BrowserFetcher {
-    /// Launch a pool of `pool_size` stealth browser instances.
-    ///
-    /// Pass `wait_selector = Some("…")` to wait for a CSS selector on every
-    /// page before capturing HTML (useful for SPAs).
-    ///
-    /// Pass `signer = Some(arc)` to inject Web Bot Auth headers before each navigation.
+    /// Launch a stealth browser with the given config.
     pub async fn new(
-        pool_size: usize,
+        launch: LaunchConfig,
         stealth: StealthConfig,
         wait_selector: Option<String>,
         signer: Option<Arc<RequestSigner>>,
     ) -> Result<Self, CrawlError> {
-        let config = PoolConfig {
-            size: pool_size,
-            stealth,
-            ..PoolConfig::default()
-        };
-        Self::with_config(config, wait_selector, signer).await
-    }
-
-    /// Launch a browser pool with a fully specified [`PoolConfig`].
-    ///
-    /// Use this when you need control over `launch.headless`, `launch.profile`,
-    /// or other low-level settings that `new()` does not expose.
-    pub async fn with_config(
-        config: PoolConfig,
-        wait_selector: Option<String>,
-        signer: Option<Arc<RequestSigner>>,
-    ) -> Result<Self, CrawlError> {
-        let pool = BrowserPool::new(config)
+        let browser = StealthBrowser::launch_with(launch, stealth)
             .await
-            .map_err(|e| CrawlError::Fetch(format!("browser pool init: {e}")))?;
+            .map_err(|e| CrawlError::Fetch(format!("browser launch: {e}")))?;
         Ok(Self {
-            pool,
+            browser,
             wait_selector,
             retry: None,
             signer,
@@ -80,23 +54,23 @@ impl BrowserFetcher {
         self
     }
 
-    /// Shut down all browser instances in the pool.
+    /// Shut down the browser.
     pub async fn shutdown(self) -> Result<(), CrawlError> {
-        self.pool
-            .shutdown()
+        self.browser
+            .close()
             .await
-            .map_err(|e| CrawlError::Fetch(format!("browser pool shutdown: {e}")))
+            .map_err(|e| CrawlError::Fetch(format!("browser shutdown: {e}")))
     }
 
     /// Perform a single browser navigation without retry.
     async fn navigate_once(&self, url: &Url) -> Result<FetchedPage, CrawlError> {
         let start = Instant::now();
 
-        let pool_page = self
-            .pool
-            .acquire()
+        let page = self
+            .browser
+            .new_blank_page()
             .await
-            .map_err(|e| CrawlError::Fetch(format!("browser acquire: {e}")))?;
+            .map_err(|e| CrawlError::Fetch(format!("browser new page: {e}")))?;
 
         if let Some(signer) = &self.signer {
             if let Ok(headers) = signer.sign_request("GET", url.as_str()) {
@@ -104,37 +78,29 @@ impl BrowserFetcher {
                 extra_headers.insert("Signature-Agent".to_string(), headers.signature_agent);
                 extra_headers.insert("Signature-Input".to_string(), headers.signature_input);
                 extra_headers.insert("Signature".to_string(), headers.signature);
-                pool_page
-                    .page()
-                    .set_extra_http_headers(extra_headers)
+                page.set_extra_http_headers(extra_headers)
                     .await
                     .map_err(|e| CrawlError::Fetch(format!("browser set headers: {e}")))?;
             }
         }
 
-        pool_page
-            .page()
-            .goto(url.as_str())
+        page.goto(url.as_str())
             .await
             .map_err(|e| CrawlError::Fetch(format!("browser goto: {e}")))?;
 
         if let Some(selector) = &self.wait_selector {
-            pool_page
-                .page()
-                .wait()
+            page.wait()
                 .for_element(selector.as_str())
                 .await
                 .map_err(|e| CrawlError::Fetch(format!("browser wait for element: {e}")))?;
         }
 
-        let body = pool_page
-            .page()
+        let body = page
             .html()
             .await
             .map_err(|e| CrawlError::Fetch(format!("browser html: {e}")))?;
 
-        let screenshot = pool_page
-            .page()
+        let screenshot = page
             .screenshot()
             .await
             .map_err(|e| CrawlError::Fetch(format!("browser screenshot: {e}")))?;

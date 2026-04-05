@@ -271,17 +271,17 @@ async fn make_fetcher(
             },
             ..dig2browser::StealthConfig::russian()
         };
-        let mut config = dig2browser::PoolConfig {
-            size: 1,
-            stealth,
-            ..dig2browser::PoolConfig::default()
+        let mut launch = dig2browser::LaunchConfig {
+            headless: !opts.headed,
+            browser_pref: dig2browser::BrowserPreference::Auto,
+            ..dig2browser::LaunchConfig::default()
         };
-        config.launch.headless = !opts.headed;
         if let Some(path) = opts.profile {
-            config.launch.profile = dig2browser::BrowserProfile::Persistent(path);
+            launch.profile = dig2browser::BrowserProfile::Persistent(path);
         }
-        let fetcher = dig2crawl::fetch::browser::BrowserFetcher::with_config(
-            config,
+        let fetcher = dig2crawl::fetch::browser::BrowserFetcher::new(
+            launch,
+            stealth,
             wait_selector,
             signer,
         )
