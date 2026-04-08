@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "dig2crawl"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "ahash",
  "anyhow",
@@ -969,9 +969,9 @@ dependencies = [
 
 [[package]]
 name = "gate4agent"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6c4482e7707244301ed60f074dbf2d5fe835184113f5d7a13b93bfb0e0dd9d6"
+checksum = "e54f230031acde7562994f8a5830a2cc2ee9686052afa87171fcc59454b4e447"
 dependencies = [
  "chrono",
  "portable-pty",
@@ -980,6 +980,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
  "vt100",
  "vte 0.13.1",
 ]
