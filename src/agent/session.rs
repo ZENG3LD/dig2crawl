@@ -1,5 +1,10 @@
 use crate::core::error::AgentError;
-use gate4agent::{AgentEvent, CliTool, SpawnOptions, TransportSession};
+use gate4agent::{
+    AgentEvent,
+    CliTool,
+    SessionConfig,
+    pipe::{PipeSession, PipeProcessOptions, ClaudeOptions},
+};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
@@ -70,11 +75,20 @@ impl AgentSession {
     /// On the first call a fresh session is started. On subsequent calls
     /// `--resume <session_id>` is passed so Claude retains full conversational context.
     pub async fn send_prompt(&mut self, prompt: &str) -> Result<String, AgentError> {
-        let options = SpawnOptions {
-            resume_session_id: self.resume_session_id.clone(),
-            append_system_prompt: self.system_prompt.clone(),
-            model: self.model.clone(),
-            ..SpawnOptions::default()
+        let config = SessionConfig {
+            tool: CliTool::ClaudeCode,
+            working_dir: self.working_dir.clone(),
+            env_vars: Vec::new(),
+            name: None,
+        };
+
+        let options = PipeProcessOptions {
+            extra_args: Vec::new(),
+            claude: ClaudeOptions {
+                resume_session_id: self.resume_session_id.clone(),
+                append_system_prompt: self.system_prompt.clone(),
+                model: self.model.clone(),
+            },
         };
 
         info!(
@@ -83,10 +97,9 @@ impl AgentSession {
             "Spawning Claude pipe session"
         );
 
-        let session =
-            TransportSession::spawn(CliTool::ClaudeCode, &self.working_dir, prompt, options)
-                .await
-                .map_err(|e| AgentError::Spawn(format!("gate4agent spawn failed: {e}")))?;
+        let session = PipeSession::spawn(config, prompt, options)
+            .await
+            .map_err(|e| AgentError::Spawn(format!("gate4agent spawn failed: {e}")))?;
 
         let mut rx = session.subscribe();
         let mut collected_text = String::new();
@@ -97,7 +110,7 @@ impl AgentSession {
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Ok(event)) => match event {
-                    AgentEvent::SessionStart {
+                    AgentEvent::PipeSessionStart {
                         session_id,
                         model,
                         tools,
@@ -110,30 +123,30 @@ impl AgentSession {
                         );
                         self.resume_session_id = Some(session_id);
                     }
-                    AgentEvent::Text { text, is_delta } => {
+                    AgentEvent::PipeText { text, is_delta } => {
                         debug!(is_delta, text_len = text.len(), "Text received");
                         collected_text.push_str(&text);
                     }
-                    AgentEvent::ToolStart { name, .. } => {
+                    AgentEvent::PipeToolStart { name, .. } => {
                         debug!(tool = %name, "Claude calling tool");
                     }
-                    AgentEvent::ToolResult {
+                    AgentEvent::PipeToolResult {
                         is_error, output, ..
                     } => {
                         if is_error {
                             warn!(output = %output, "Tool call returned error");
                         }
                     }
-                    AgentEvent::Thinking { text } => {
+                    AgentEvent::PipeThinking { text } => {
                         debug!(thinking_len = text.len(), "Claude thinking");
                     }
-                    AgentEvent::TurnComplete {
+                    AgentEvent::PipeTurnComplete {
                         input_tokens,
                         output_tokens,
                     } => {
                         info!(input_tokens, output_tokens, "Turn complete");
                     }
-                    AgentEvent::SessionEnd {
+                    AgentEvent::PipeSessionEnd {
                         result,
                         cost_usd,
                         is_error,
